@@ -1,5 +1,5 @@
 # GEAR: Co-Evolving Grounded VLM Agents with Environment-Aligned Rubrics
-
+![GEAR](gear.png)
 This repository implements **GEAR (Grounded Environment-Aligned Rubrics)**.
 GEAR trains a multi-turn vision-language agent under two coupled roles:
 
