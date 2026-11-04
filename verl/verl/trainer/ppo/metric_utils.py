@@ -221,19 +221,19 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
-    # Per-role metrics for dual-role (rlcer) batches.
+    # Per-role metrics for dual-role (gear) batches.
     # When rubricator samples are present, the joint-batch token-level mean of
     # returns/values is diluted by rubricator's near-zero entries.  Computing
     # reasoner-only statistics lets us disentangle metric dilution from genuine
     # critic/training issues.  We also emit rubricator-side stats and valid-token
     # counts so the *dilution ratio* itself is observable, not just the means.
-    rlcer_role = batch.non_tensor_batch.get("rlcer_role", None)
-    if rlcer_role is not None:
-        is_rea = np.array([r == "reasoner" for r in rlcer_role])
+    gear_role = batch.non_tensor_batch.get("gear_role", None)
+    if gear_role is not None:
+        is_rea = np.array([r == "reasoner" for r in gear_role])
         n_rea = int(is_rea.sum())
         n_rub = int((~is_rea).sum())
-        metrics["rlcer/role_count/reasoner"] = float(n_rea)
-        metrics["rlcer/role_count/rubricator"] = float(n_rub)
+        metrics["gear/role_count/reasoner"] = float(n_rea)
+        metrics["gear/role_count/rubricator"] = float(n_rub)
 
         rea_valid_tokens = 0
         if n_rea > 0:
@@ -242,7 +242,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             rea_idx = torch.as_tensor(np.where(is_rea)[0], device=returns.device, dtype=torch.long)
             rea_resp_mask = response_mask[rea_idx]
             rea_valid_tokens = int(rea_resp_mask.sum().item())
-            metrics["rlcer/valid_tokens/reasoner"] = float(rea_valid_tokens)
+            metrics["gear/valid_tokens/reasoner"] = float(rea_valid_tokens)
 
             # Per-sequence score/reward (reasoner only, non-aborted)
             rea_non_aborted = non_aborted_mask.cpu().numpy()[is_rea]
@@ -280,9 +280,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             rub_idx = torch.as_tensor(np.where(~is_rea)[0], device=returns.device, dtype=torch.long)
             rub_resp_mask = response_mask[rub_idx]
             rub_valid_tokens = int(rub_resp_mask.sum().item())
-            metrics["rlcer/valid_tokens/rubricator"] = float(rub_valid_tokens)
+            metrics["gear/valid_tokens/rubricator"] = float(rub_valid_tokens)
             if rea_valid_tokens > 0 and rub_valid_tokens > 0:
-                metrics["rlcer/valid_token_ratio/reasoner"] = float(
+                metrics["gear/valid_token_ratio/reasoner"] = float(
                     rea_valid_tokens / (rea_valid_tokens + rub_valid_tokens)
                 )
             rub_returns = torch.masked_select(returns[rub_idx], rub_resp_mask)
@@ -512,7 +512,7 @@ def process_validation_metrics(
                 if isinstance(var_vals[0], str):
                     continue
 
-                # Skip non-numeric / None entries. Frozenlake's rlcer reward-extra
+                # Skip non-numeric / None entries. Frozenlake's gear reward-extra
                 # pipeline can emit None for fields not applicable on a given
                 # sample (e.g. first-turn history fields). np.mean on a list
                 # containing None raises

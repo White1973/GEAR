@@ -44,7 +44,7 @@ class BatchRewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.reward_kwargs = reward_kwargs
         # Mark whether the compute_score is a custom (user-provided) reward function.
-        # Custom reward functions (e.g. RLCER) should always be invoked even when
+        # Custom reward functions (e.g. GEAR) should always be invoked even when
         # rm_scores from the environment already exist, because they may combine
         # the outcome reward with additional signals (cot_reward, rubricator_reward, etc.).
         self._is_custom_reward_fn = getattr(compute_score, '_is_custom_reward_fn', False)
@@ -76,13 +76,19 @@ class BatchRewardManager(AbstractRewardManager):
         # Environment-side fields (for example traj_success, dino_score and
         # dreamsim_score) must be visible to the custom reward function, not
         # only merged into the returned logging dictionary after scoring.
-        # RLCER uses these values as the grounded target z for rubric
+        # GEAR uses these values as the grounded target z for rubric
         # validation.
         score_context_keys = set(reward_extra_keys) | {
             "traj_success",
             "dino_score",
             "dreamsim_score",
             "turn_env_states",
+            "turn_response_starts",
+            "turn_response_ends",
+            "turn_response_texts",
+            "turn_images",
+            "turn_env_rewards",
+            "turn_verifier_contexts",
             "initial_env_state",
             "verifier_context",
         }
@@ -103,8 +109,8 @@ class BatchRewardManager(AbstractRewardManager):
                     extras[i]["env_reward"] = float(data.batch["rm_scores"][i, resp_mask - 1].item())
             if "image_data" in data.non_tensor_batch:
                 extras[i]["image_data"] = data.non_tensor_batch["image_data"][i]
-            if "rlcer_policy_rubric_raw" in data.non_tensor_batch:
-                extras[i]["rlcer_policy_rubric_raw"] = data.non_tensor_batch["rlcer_policy_rubric_raw"][i]
+            if "gear_policy_rubric_raw" in data.non_tensor_batch:
+                extras[i]["gear_policy_rubric_raw"] = data.non_tensor_batch["gear_policy_rubric_raw"][i]
             if "uid" in data.non_tensor_batch:
                 extras[i]["uid"] = data.non_tensor_batch["uid"][i]
             if "group_idx" in data.non_tensor_batch:
@@ -119,11 +125,11 @@ class BatchRewardManager(AbstractRewardManager):
                 extras[i]["initial_env_state"] = data.non_tensor_batch["initial_env_state"][i]
             if "verifier_context" in data.non_tensor_batch:
                 extras[i]["verifier_context"] = data.non_tensor_batch["verifier_context"][i]
-            # Optional, behavior-neutral metadata used only by sparse RLCER
+            # Optional, behavior-neutral metadata used only by sparse GEAR
             # mechanism auditing. It is injected by vagen/ray_trainer.py only
             # when rubric_audit.enabled=true.
-            if "rlcer_global_step" in data.non_tensor_batch:
-                extras[i]["rlcer_global_step"] = data.non_tensor_batch["rlcer_global_step"][i]
+            if "gear_global_step" in data.non_tensor_batch:
+                extras[i]["gear_global_step"] = data.non_tensor_batch["gear_global_step"][i]
 
         scores = self.compute_score(
             data_sources=data_sources,
@@ -137,7 +143,7 @@ class BatchRewardManager(AbstractRewardManager):
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         # If there is rm score and compute_score is the default one, we directly
-        # return rm score.  Custom reward functions (e.g. RLCER) are always invoked
+        # return rm score.  Custom reward functions (e.g. GEAR) are always invoked
         # because they may combine outcome reward with additional signals.
         if "rm_scores" in data.batch.keys() and not self._is_custom_reward_fn:
             if return_dict:

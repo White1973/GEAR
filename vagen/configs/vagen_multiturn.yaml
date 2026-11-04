@@ -33,7 +33,10 @@ data:
 actor_rollout_ref:
   hybrid_engine: True   
   rollout:
-    name: sglang        
+    name: sglang
+    temperature: 0.7   # paper setting for rollout generation
+    val_kwargs:
+      temperature: 0.7 # paper setting for inference/evaluation generation
     multi_turn:
       enable: True       
 
@@ -78,24 +81,25 @@ huggingface_hub:
   upload_contents: ['hf_model']            
 
 # ============================================================================
-# RLCER (optional): custom reward with self-proposed rubrics
+# GEAR (optional): custom reward with self-proposed rubrics
 #
 # To enable:
 # 1) set reward manager to batch mode
-# 2) point custom_reward_function.path to vagen/rlcer/reward_rlcer.py
+# 2) point custom_reward_function.path to vagen/gear/reward_gear.py
 # 3) pass reward_kwargs below
 #
 # Example CLI overrides:
 #   reward_model.reward_manager=batch \
-#   custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+#   custom_reward_function.path=vagen/gear/reward_gear.py \
 #   custom_reward_function.name=compute_score
 # ============================================================================
 custom_reward_function:
-  path: vagen/rlcer/reward_rlcer.py
+  path: vagen/gear/reward_gear.py
   name: compute_score
   reward_kwargs:
     alpha: 0.2
     lambda_cot: 0.0
+    turn_level_process_reward: true  # evaluate/credit each local turn; false restores trajectory-level behavior
     rubricator_loss_weight: 0.001
     rubricator_subsample_size: 0     # 0 = use actor PPO mini-batch size; set explicitly for isolated updates
     rubricator_update_interval: 1    # auxiliary actor update every N trainer steps
@@ -127,6 +131,7 @@ custom_reward_function:
     pure_outcome: false
     policy_rubricator_use_actor_generation: true
     policy_rubricator_max_new_tokens: 4096
+    policy_rubricator_temperature: 0.7  # paper VLM generation temperature
     fallback_to_heuristic: true
     # --- Feature flags (all default True for new behavior; set to False to revert) ---
     normalize_rubric_weights: true    # Clamp + L1-normalize rubric weights to prevent inflation
@@ -155,6 +160,7 @@ custom_reward_function:
       api_key: "EMPTY"
       model: ""
       timeout: 60
+      temperature: 0.7
       max_rubrics: 8
     verifier:
       # mode: heuristic | external

@@ -73,8 +73,8 @@ class BatchRewardManager(AbstractRewardManager):
             extras[i]["prompt_str"] = prompts_str[i]
             if "image_data" in data.non_tensor_batch:
                 extras[i]["image_data"] = data.non_tensor_batch["image_data"][i]
-            if "rlcer_policy_rubric_raw" in data.non_tensor_batch:
-                extras[i]["rlcer_policy_rubric_raw"] = data.non_tensor_batch["rlcer_policy_rubric_raw"][i]
+            if "gear_policy_rubric_raw" in data.non_tensor_batch:
+                extras[i]["gear_policy_rubric_raw"] = data.non_tensor_batch["gear_policy_rubric_raw"][i]
             if "uid" in data.non_tensor_batch:
                 extras[i]["uid"] = data.non_tensor_batch["uid"][i]
             if "group_idx" in data.non_tensor_batch:

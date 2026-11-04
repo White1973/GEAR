@@ -1,7 +1,7 @@
 """Rubricator scheduler for anti-Nash equilibrium and plateau detection.
 
 Monitors training signals (corr_mean, valid_ratio, trivial_scale, validation
-metrics) and dynamically adjusts RLCER control knobs (lambda_cot,
+metrics) and dynamically adjusts GEAR control knobs (lambda_cot,
 rubricator_loss_weight, pure_outcome, enable_dual_role_update) to prevent
 the rubricator-reasoner system from collapsing into a Nash equilibrium where
 both achieve high internal rewards without improving actual task outcome.
@@ -30,7 +30,7 @@ from omegaconf import OmegaConf, open_dict
 
 
 class RubricatorScheduler:
-    """Runtime scheduler that adjusts RLCER control knobs based on training signals.
+    """Runtime scheduler that adjusts GEAR control knobs based on training signals.
 
     Config is read from ``custom_reward_function.reward_kwargs.scheduler``.
     When all sub-mechanisms are disabled (the default), the scheduler is a
@@ -178,7 +178,7 @@ class RubricatorScheduler:
                 ``_compute_score_batched`` (keys include ``corr_mean``,
                 ``valid_ratio``, ``trivial_scale``, etc.).
             metrics: Training metrics dict (scheduler will append its own
-                metrics under ``rlcer/scheduler/``).
+                metrics under ``gear/scheduler/``).
             val_metrics: Validation metrics dict from ``_validate()``.
                 Only provided on steps where validation runs.
         """
@@ -491,51 +491,51 @@ class RubricatorScheduler:
 
     def _log_metrics(self, metrics: Dict[str, Any]) -> None:
         """Append scheduler state to the training metrics dict for wandb."""
-        metrics["rlcer/scheduler/corr_ema"] = self._corr_ema
-        metrics["rlcer/scheduler/corr_low_counter"] = self._corr_low_counter
-        metrics["rlcer/scheduler/valid_ratio_ema"] = self._valid_ratio_ema
-        metrics["rlcer/scheduler/trivial_scale_ema"] = self._trivial_scale_ema
-        metrics["rlcer/scheduler/lambda_cot_effective"] = self._curr_lambda_cot
-        metrics["rlcer/scheduler/rub_loss_weight_effective"] = (
+        metrics["gear/scheduler/corr_ema"] = self._corr_ema
+        metrics["gear/scheduler/corr_low_counter"] = self._corr_low_counter
+        metrics["gear/scheduler/valid_ratio_ema"] = self._valid_ratio_ema
+        metrics["gear/scheduler/trivial_scale_ema"] = self._trivial_scale_ema
+        metrics["gear/scheduler/lambda_cot_effective"] = self._curr_lambda_cot
+        metrics["gear/scheduler/rub_loss_weight_effective"] = (
             self._curr_rub_loss_weight
         )
-        metrics["rlcer/scheduler/pure_outcome_active"] = float(
+        metrics["gear/scheduler/pure_outcome_active"] = float(
             self._curr_pure_outcome
         )
-        metrics["rlcer/scheduler/plateau_frozen"] = float(
+        metrics["gear/scheduler/plateau_frozen"] = float(
             self._frozen and self._freeze_reason == "plateau"
         )
-        metrics["rlcer/scheduler/corr_gate_frozen"] = float(
+        metrics["gear/scheduler/corr_gate_frozen"] = float(
             self._frozen and self._freeze_reason == "corr_gating"
         )
         state_id = {"normal": 0.0, "recovery": 1.0, "warm_restart": 2.0}
-        metrics["rlcer/scheduler/health_state"] = state_id[self._health_state]
-        metrics["rlcer/scheduler/recovery_active"] = float(
+        metrics["gear/scheduler/health_state"] = state_id[self._health_state]
+        metrics["gear/scheduler/recovery_active"] = float(
             self._health_state == "recovery"
         )
-        metrics["rlcer/scheduler/health_bad_steps"] = self._health_bad_steps
-        metrics["rlcer/scheduler/health_good_steps"] = self._health_good_steps
-        metrics["rlcer/scheduler/proposal_format_ok_ema"] = (
+        metrics["gear/scheduler/health_bad_steps"] = self._health_bad_steps
+        metrics["gear/scheduler/health_good_steps"] = self._health_good_steps
+        metrics["gear/scheduler/proposal_format_ok_ema"] = (
             self._proposal_format_ok_ema
         )
-        metrics["rlcer/scheduler/proposal_nonempty_ema"] = (
+        metrics["gear/scheduler/proposal_nonempty_ema"] = (
             self._proposal_nonempty_ema
         )
 
         if self.warmup_enabled and self._step <= self.warmup_steps:
             warmup_progress = self._step / max(self.warmup_steps, 1)
-            metrics["rlcer/scheduler/warmup_active"] = 1.0
-            metrics["rlcer/scheduler/warmup_progress"] = warmup_progress
+            metrics["gear/scheduler/warmup_active"] = 1.0
+            metrics["gear/scheduler/warmup_progress"] = warmup_progress
         else:
-            metrics["rlcer/scheduler/warmup_active"] = 0.0
-            metrics["rlcer/scheduler/warmup_progress"] = -1.0
+            metrics["gear/scheduler/warmup_active"] = 0.0
+            metrics["gear/scheduler/warmup_progress"] = -1.0
 
         if self.plateau_enabled:
-            metrics["rlcer/scheduler/plateau_history_len"] = len(
+            metrics["gear/scheduler/plateau_history_len"] = len(
                 self._plateau_history
             )
             if self._plateau_history:
-                metrics["rlcer/scheduler/last_val_metric"] = (
+                metrics["gear/scheduler/last_val_metric"] = (
                     self._plateau_history[-1]
                 )
-            metrics["rlcer/scheduler/plateau_counter"] = self._plateau_counter
+            metrics["gear/scheduler/plateau_counter"] = self._plateau_counter

@@ -44,7 +44,7 @@ class NaiveRewardManager(AbstractRewardManager):
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
         # Mark whether the compute_score is a custom (user-provided) reward function.
-        # Custom reward functions (e.g. RLCER) should always be invoked even when
+        # Custom reward functions (e.g. GEAR) should always be invoked even when
         # rm_scores from the environment already exist, because they may combine
         # the outcome reward with additional signals (cot_reward, rubricator_reward, etc.).
         self._is_custom_reward_fn = getattr(self.compute_score, '_is_custom_reward_fn', False)
@@ -53,7 +53,7 @@ class NaiveRewardManager(AbstractRewardManager):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score and compute_score is the default one, we directly
-        # return rm score.  Custom reward functions (e.g. RLCER) are always invoked
+        # return rm score.  Custom reward functions (e.g. GEAR) are always invoked
         # because they may combine outcome reward with additional signals.
         if "rm_scores" in data.batch.keys() and not self._is_custom_reward_fn:
             if return_dict:

@@ -403,8 +403,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-        if "rlcer_role" in data.non_tensor_batch.keys():
-            non_tensor_select_keys.append("rlcer_role")
+        if "gear_role" in data.non_tensor_batch.keys():
+            non_tensor_select_keys.append("gear_role")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -483,11 +483,11 @@ class DataParallelPPOActor(BasePPOActor):
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    rlcer_roles = model_inputs.get("rlcer_role", None)
+                    gear_roles = model_inputs.get("gear_role", None)
 
-                    if batch_has_dual_role and rlcer_roles is not None:
+                    if batch_has_dual_role and gear_roles is not None:
                         is_reasoner = torch.tensor(
-                            [r == "reasoner" for r in rlcer_roles], dtype=torch.bool, device=response_mask.device
+                            [r == "reasoner" for r in gear_roles], dtype=torch.bool, device=response_mask.device
                         )
                         rea_mask = response_mask * is_reasoner.unsqueeze(1).float()
                         rub_mask = response_mask * (~is_reasoner).unsqueeze(1).float()
@@ -627,9 +627,9 @@ class DataParallelPPOActor(BasePPOActor):
         """
         if self.scaler is not None:
             raise NotImplementedError("protected multirole update currently requires bf16/fp32")
-        roles = data.non_tensor_batch.get("rlcer_role")
+        roles = data.non_tensor_batch.get("gear_role")
         if roles is None:
-            raise ValueError("protected multirole update requires rlcer_role")
+            raise ValueError("protected multirole update requires gear_role")
         roles = np.asarray(roles)
         reasoner_idx = np.where(roles == "reasoner")[0]
         rubricator_idx = np.where(roles == "rubricator")[0]
@@ -721,13 +721,13 @@ class DataParallelPPOActor(BasePPOActor):
             metrics[f"actor_rub/{suffix}"] = value
         metrics.update(
             {
-                "rlcer/grad/reasoner_norm": float(reasoner_norm.item()),
-                "rlcer/grad/rubricator_norm": float(rubricator_norm.item()),
-                "rlcer/grad/cosine": float(cosine.item()),
-                "rlcer/grad/conflict": float(dot.item() < 0.0),
-                "rlcer/grad/projected_rubricator_norm": float(projected_norm.item()),
-                "rlcer/grad/rubricator_cap_scale": cap_scale,
-                "rlcer/grad/rubricator_effective_ratio": float(
+                "gear/grad/reasoner_norm": float(reasoner_norm.item()),
+                "gear/grad/rubricator_norm": float(rubricator_norm.item()),
+                "gear/grad/cosine": float(cosine.item()),
+                "gear/grad/conflict": float(dot.item() < 0.0),
+                "gear/grad/projected_rubricator_norm": float(projected_norm.item()),
+                "gear/grad/rubricator_cap_scale": cap_scale,
+                "gear/grad/rubricator_effective_ratio": float(
                     min(cap_ratio, (projected_norm * cap_scale / reasoner_norm).item())
                 ),
                 "actor/grad_norm": float(combined_grad_norm.detach().item()),

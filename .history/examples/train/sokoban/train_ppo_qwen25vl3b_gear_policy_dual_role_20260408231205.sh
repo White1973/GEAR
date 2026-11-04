@@ -3,10 +3,13 @@
 set -x
 
 PROJECT_NAME="vagen_experiments"
-EXPERIMENT_NAME="ppo_qwen25vl3b_rlcer_dual_role_extverifier"
+EXPERIMENT_NAME="ppo_qwen25vl3b_gear_dual_role"
 
-BASEDIR=$(pwd)
-SCRIPTDIR=$(dirname "$0")
+SCRIPTDIR=$(cd "$(dirname "$0")" && pwd)
+BASEDIR=$(cd "${SCRIPTDIR}/../../.." && pwd)
+# Ensure local verl package (BASEDIR/verl/verl) is importable even without `pip install -e ./verl`.
+export PYTHONPATH="${BASEDIR}/verl:${BASEDIR}:${PYTHONPATH}"
+
 EXPERIMENT_DIR=${BASEDIR}/exps/${PROJECT_NAME}/${EXPERIMENT_NAME}
 SAVE_CHECKPOINT_DIR=${EXPERIMENT_DIR}/verl_checkpoints
 DATASET_TRAIN=${SCRIPTDIR}/train_sokoban_vision.yaml
@@ -14,16 +17,11 @@ DATASET_VAL=${SCRIPTDIR}/val_sokoban_vision.yaml
 agent_loop_config_path=${BASEDIR}/vagen/configs/agent.yaml
 REF_MODEL_PATH=Qwen/Qwen2.5-VL-3B-Instruct
 
-# Rubricator(policy): 指向与 solver 相同模型服务（OpenAI-compatible）
+# OpenAI-compatible endpoint for rubricator.policy mode.
+# 说明：policy 模式下 rubricator 会通过该服务调用“同一个模型”。
 RUBRICATOR_BASE_URL=${RUBRICATOR_BASE_URL:-"http://127.0.0.1:8000/v1"}
 RUBRICATOR_MODEL=${RUBRICATOR_MODEL:-"Qwen/Qwen2.5-VL-3B-Instruct"}
 RUBRICATOR_API_KEY=${RUBRICATOR_API_KEY:-"EMPTY"}
-
-# Verifier(external): 外部评估模型服务（可与 rubricator 分离）
-VERIFIER_BASE_URL=${VERIFIER_BASE_URL:-"http://127.0.0.1:8000/v1"}
-VERIFIER_MODEL=${VERIFIER_MODEL:-"Qwen/Qwen2.5-VL-3B-Instruct"}
-VERIFIER_API_KEY=${VERIFIER_API_KEY:-"EMPTY"}
-VERIFIER_TIMEOUT=${VERIFIER_TIMEOUT:-60}
 
 mkdir -p ${EXPERIMENT_DIR}
 
@@ -88,7 +86,7 @@ PYTHONUNBUFFERED=1 python3 -m vagen.main_ppo \
     critic.model.fsdp_config.param_offload=True \
     critic.model.fsdp_config.optimizer_offload=True \
     reward_model.reward_manager=batch \
-    custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+    custom_reward_function.path=vagen/gear/reward_gear.py \
     custom_reward_function.name=compute_score \
     custom_reward_function.reward_kwargs.enable_dual_role_update=true \
     custom_reward_function.reward_kwargs.alpha=0.2 \
@@ -100,10 +98,6 @@ PYTHONUNBUFFERED=1 python3 -m vagen.main_ppo \
     custom_reward_function.reward_kwargs.rubricator.api_key=${RUBRICATOR_API_KEY} \
     custom_reward_function.reward_kwargs.rubricator.model=${RUBRICATOR_MODEL} \
     custom_reward_function.reward_kwargs.rubricator.max_rubrics=8 \
-    custom_reward_function.reward_kwargs.verifier.mode=external \
-    custom_reward_function.reward_kwargs.verifier.base_url=${VERIFIER_BASE_URL} \
-    custom_reward_function.reward_kwargs.verifier.api_key=${VERIFIER_API_KEY} \
-    custom_reward_function.reward_kwargs.verifier.model=${VERIFIER_MODEL} \
-    custom_reward_function.reward_kwargs.verifier.timeout=${VERIFIER_TIMEOUT} \
+    custom_reward_function.reward_kwargs.verifier.mode=heuristic \
     trainer.total_training_steps=401 2>&1 | \
     tee ${EXPERIMENT_DIR}/${PROJECT_NAME}_${EXPERIMENT_NAME}.log >(tee ${BASEDIR}/${PROJECT_NAME}_${EXPERIMENT_NAME}.log >/dev/null)

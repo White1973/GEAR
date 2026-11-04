@@ -767,7 +767,7 @@ class RayPPOTrainer:
         reward_tensor[row_idx, col_idx] = scores
         return reward_tensor
 
-    def _build_rlcer_joint_training_batch(
+    def _build_gear_joint_training_batch(
         self,
         reasoner_batch: DataProto,
         reasoner_reward_tensor: torch.Tensor,
@@ -783,21 +783,21 @@ class RayPPOTrainer:
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         enable_dual_role_update = reward_cfg.get("enable_dual_role_update", False)
 
-        reasoner_batch.non_tensor_batch["rlcer_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
+        reasoner_batch.non_tensor_batch["gear_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
         if not enable_dual_role_update:
             return reasoner_batch
 
         rubricator_rewards = reward_extra_infos_dict.get("rubricator_reward", None)
         if rubricator_rewards is None:
-            metrics["rlcer/train/dual_role_skipped_no_rubricator_reward"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_rubricator_reward"] = 1.0
             return reasoner_batch
         if len(rubricator_rewards) != len(reasoner_batch):
-            metrics["rlcer/train/dual_role_skipped_len_mismatch"] = 1.0
+            metrics["gear/train/dual_role_skipped_len_mismatch"] = 1.0
             return reasoner_batch
 
         rubricator_scores = torch.tensor(rubricator_rewards, dtype=torch.float32, device=reasoner_reward_tensor.device)
         rubricator_batch = deepcopy(reasoner_batch)
-        rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
+        rubricator_batch.non_tensor_batch["gear_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
 
         rubricator_reward_tensor = self._build_terminal_reward_tensor_from_scores(rubricator_batch, rubricator_scores)
         rubricator_batch.batch["token_level_scores"] = rubricator_reward_tensor
@@ -820,10 +820,10 @@ class RayPPOTrainer:
 
         joint_batch = DataProto.concat([reasoner_batch, rubricator_batch])
 
-        metrics["rlcer/train/dual_role_enabled"] = 1.0
-        metrics["rlcer/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
+        metrics["gear/train/dual_role_enabled"] = 1.0
+        metrics["gear/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
         return joint_batch
 
     def _validate(self):

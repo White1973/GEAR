@@ -3,7 +3,7 @@
 set -x
 
 PROJECT_NAME="vagen_experiments"
-EXPERIMENT_NAME="ppo_qwen25vl3b_rlcer_dual_role"
+EXPERIMENT_NAME="ppo_qwen25vl3b_gear_dual_role"
 
 BASEDIR=$(pwd)
 SCRIPTDIR=$(dirname "$0")
@@ -83,7 +83,7 @@ PYTHONUNBUFFERED=1 python3 -m vagen.main_ppo \
     critic.model.fsdp_config.param_offload=True \
     critic.model.fsdp_config.optimizer_offload=True \
     reward_model.reward_manager=batch \
-    custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+    custom_reward_function.path=vagen/gear/reward_gear.py \
     custom_reward_function.name=compute_score \
     custom_reward_function.reward_kwargs.enable_dual_role_update=true \
     custom_reward_function.reward_kwargs.alpha=0.2 \

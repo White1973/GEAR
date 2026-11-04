@@ -14,7 +14,11 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from verl.utils.reward_score import default_compute_score
-from vagen.rlcer.prompt_templates import NEW_SYSTEM_CONTENT, USER_CONTENT
+from vagen.gear.prompt_templates import (
+    NEW_SYSTEM_CONTENT,
+    USER_CONTENT,
+    get_rubricator_prompts,
+)
 
 
 def _strip_multimodal_placeholders(text: str) -> str:
@@ -280,13 +284,16 @@ def _build_trajectory_history_for_items(items: List[dict]) -> List[str]:
     return histories
 
 
-def _compose_rubricator_system_content(trajectory_history: str) -> str:
+def _compose_rubricator_system_content(
+    trajectory_history: str,
+    base_content: str = NEW_SYSTEM_CONTENT,
+) -> str:
     history_text = trajectory_history.strip() if trajectory_history else "None (Initial Turn)"
     marker = "## [Trajectory History] None (Initial Turn)"
-    if marker in NEW_SYSTEM_CONTENT:
-        return NEW_SYSTEM_CONTENT.replace(marker, f"## [Trajectory History] {history_text}")
+    if marker in base_content:
+        return base_content.replace(marker, f"## [Trajectory History] {history_text}")
     # robust fallback
-    return NEW_SYSTEM_CONTENT + f"\n\n## [Trajectory History] {history_text}"
+    return base_content + f"\n\n## [Trajectory History] {history_text}"
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +492,7 @@ def _parse_rubric_proposal_from_raw(raw: str, max_rubrics: int) -> RubricProposa
 
     rubrics_raw = obj.get("rubrics", [])
     # if not rubrics_raw:
-    #     print(f"[RLCER] rubric JSON has no 'rubrics' field, keys: {list(obj.keys())}, raw preview: {raw[:200]!r}")
+    #     print(f"[GEAR] rubric JSON has no 'rubrics' field, keys: {list(obj.keys())}, raw preview: {raw[:200]!r}")
     rubrics: List[Rubric] = []
     for item in rubrics_raw:
         if not isinstance(item, dict):
@@ -508,7 +515,7 @@ def _parse_rubric_proposal_from_raw(raw: str, max_rubrics: int) -> RubricProposa
     if not rubrics:
         rubrics = _extract_rubrics_from_malformed_text(raw, max_rubrics)
         # if rubrics:
-        #     print(f"[RLCER] regex fallback extracted {len(rubrics)} rubrics (JSON rubrics field was empty/invalid)")
+        #     print(f"[GEAR] regex fallback extracted {len(rubrics)} rubrics (JSON rubrics field was empty/invalid)")
    
     rubrics = rubrics[: max_rubrics]
     rubrics = _clamp_and_normalize_rubrics(rubrics)
@@ -518,7 +525,7 @@ def _parse_rubric_proposal_from_raw(raw: str, max_rubrics: int) -> RubricProposa
 def _extract_policy_rubric_proposal_from_extra(extra_info: dict, max_rubrics: int) -> Optional[RubricProposal]:
     if not isinstance(extra_info, dict):
         return None
-    raw = extra_info.get("rlcer_policy_rubric_raw", None)
+    raw = extra_info.get("gear_policy_rubric_raw", None)
     if raw is None:
         return None
 
@@ -753,7 +760,7 @@ class LLMRubricator(BaseRubricator):
             timeout=float(cfg.get("timeout", 60.0)),
         )
         self.max_rubrics = int(cfg.get("max_rubrics", 8))
-        self.temperature = float(cfg.get("temperature", 0.3))
+        self.temperature = float(cfg.get("temperature", 0.7))
         self.top_p = float(cfg.get("top_p", 0.9))
 
     def generate(self, question: str, response: str, cot: str, **kwargs) -> RubricProposal:
@@ -773,16 +780,24 @@ class LLMRubricator(BaseRubricator):
         stripped_response = _strip_multimodal_placeholders(response or "")
 
         # Build user_tail matching the structure used by
-        # ray_trainer._build_rlcer_policy_rubricator_prompts.
+        # ray_trainer._build_gear_policy_rubricator_prompts.
         user_tail = (
             f"\n\n[Turn ID]\n{turn_id}\n"
             f"\n[Solver Response]\n{stripped_response}\n"
             "\n[Constraint]\nReturn ONLY the JSON in a json block."
         )
 
+        extra_info = kwargs.get("extra_info", {}) or {}
+        data_source = extra_info.get("data_source", kwargs.get("data_source"))
+        system_template, user_template, task_instruction = get_rubricator_prompts(
+            data_source
+        )
         system_msg = {
             "role": "system",
-            "content": _compose_rubricator_system_content(trajectory_history),
+            "content": _compose_rubricator_system_content(
+                trajectory_history,
+                base_content=system_template,
+            ),
         }
 
         if image_url is not None:
@@ -792,7 +807,7 @@ class LLMRubricator(BaseRubricator):
                 {"type": "image_url", "image_url": {"url": image_url}},
                 {
                     "type": "text",
-                    "text": "\nAnalyze the current Sokoban board state and generate evaluation rubrics." + user_tail,
+                    "text": f"\n{task_instruction}" + user_tail,
                 },
             ]
             user_msg = {"role": "user", "content": user_content}
@@ -800,7 +815,7 @@ class LLMRubricator(BaseRubricator):
             # Text-only fallback: use USER_CONTENT template + user_tail
             user_msg = {
                 "role": "user",
-                "content": f"{USER_CONTENT}\n{user_tail}",
+                "content": f"{user_template}\n{user_tail}",
             }
 
         raw = self.client.chat([system_msg, user_msg], temperature=self.temperature, top_p=self.top_p, max_tokens=1500)
@@ -1698,6 +1713,158 @@ def _question_text(extra_info: dict) -> str:
     return ""
 
 
+
+def _compute_score_batched_turn_level(
+    *,
+    data_sources,
+    solution_strs,
+    ground_truths,
+    extra_infos,
+    outcome_weight: float,
+    lambda_cot: float,
+    inner_kwargs: dict,
+) -> List[dict]:
+    """Validate rubrics on full trajectories, then score each local transition.
+
+    The paper uses trajectory-level satisfaction vectors to decide whether a
+    proposed rubric correlates with grounded outcomes across sampled
+    trajectories.  Only after that validation is the accepted rubric mask
+    reused to compute each turn's local process reward.
+    """
+    # Stage 1: validate each proposal over complete trajectories. This is the
+    # only stage allowed to update the historical correlation tracker.
+    trajectory_kwargs = dict(inner_kwargs)
+    trajectory_kwargs["_return_rubric_validation_details"] = True
+    trajectory_outputs = _compute_score_batched(
+        data_sources=data_sources,
+        solution_strs=solution_strs,
+        ground_truths=ground_truths,
+        extra_infos=extra_infos,
+        outcome_weight=0.0,
+        lambda_cot=0.0,
+        turn_level_process_reward=False,
+        **trajectory_kwargs,
+    )
+
+    flat_sources: List[Any] = []
+    flat_solutions: List[str] = []
+    flat_ground_truths: List[Any] = []
+    flat_extras: List[dict] = []
+    parent_turn_indices: List[List[int]] = [[] for _ in solution_strs]
+    parent_positions: List[List[int]] = [[] for _ in solution_strs]
+
+    for parent_idx, solution in enumerate(solution_strs):
+        parent_extra = dict(extra_infos[parent_idx] or {})
+        validation = trajectory_outputs[parent_idx]
+        responses = list(parent_extra.get("turn_response_texts") or [])
+        ends = list(parent_extra.get("turn_response_ends") or [])
+        starts = list(parent_extra.get("turn_response_starts") or [])
+        images = list(parent_extra.get("turn_images") or [])
+        states = list(parent_extra.get("turn_env_states") or [])
+        contexts = list(parent_extra.get("turn_verifier_contexts") or [])
+        env_rewards = list(parent_extra.get("turn_env_rewards") or [])
+
+        # Backward-compatible fallback for batches produced before turn metadata
+        # was added. Such a row is treated as a one-turn trajectory.
+        if not responses:
+            responses = [str(solution)]
+            ends = []
+
+        base_group = _group_key(parent_extra, parent_idx)
+        for turn_idx, response in enumerate(responses):
+            turn_extra = dict(parent_extra)
+            turn_extra["group_idx"] = f"{base_group}::turn:{turn_idx}"
+            turn_extra["turn_idx"] = turn_idx
+            turn_extra["turn_env_states"] = [states[turn_idx]] if turn_idx < len(states) else []
+            turn_extra["initial_env_state"] = (
+                parent_extra.get("initial_env_state")
+                if turn_idx == 0
+                else (states[turn_idx - 1] if turn_idx - 1 < len(states) else None)
+            )
+            turn_extra["verifier_context"] = contexts[turn_idx] if turn_idx < len(contexts) else {}
+            if turn_idx < len(images) and images[turn_idx] is not None:
+                turn_extra["image_data"] = [images[turn_idx]]
+            if turn_idx < len(env_rewards):
+                turn_extra["turn_env_reward"] = float(env_rewards[turn_idx])
+
+            # Freeze the trajectory-level validation decision. Local transition
+            # judgements must not re-estimate correlation or update its tracker.
+            turn_extra["_prevalidated_rubric_proposal"] = validation.get(
+                "_rubric_proposal"
+            )
+            turn_extra["_prevalidated_rubric_mask"] = list(
+                validation.get("rubric_valid_flags", [])
+            )
+            turn_extra["_prevalidated_correlations"] = list(
+                validation.get("rubric_correlations", [])
+            )
+            turn_extra["_prevalidated_target_is_computable"] = bool(
+                validation.get("group_target_computable", 0.0)
+            )
+            turn_extra["_skip_tracker_update"] = True
+
+            flat_idx = len(flat_solutions)
+            parent_turn_indices[parent_idx].append(flat_idx)
+            position = 0
+            if turn_idx < len(ends):
+                start_pos = int(starts[turn_idx]) if turn_idx < len(starts) else 0
+                end_pos = int(ends[turn_idx])
+                if end_pos > start_pos:
+                    position = end_pos
+            parent_positions[parent_idx].append(position)
+
+            flat_sources.append(data_sources[parent_idx])
+            flat_solutions.append(str(response))
+            flat_ground_truths.append(ground_truths[parent_idx])
+            flat_extras.append(turn_extra)
+
+    local_kwargs = dict(inner_kwargs)
+    local_kwargs["rubric_audit"] = {"enabled": False}
+    turn_outputs = _compute_score_batched(
+        data_sources=flat_sources,
+        solution_strs=flat_solutions,
+        ground_truths=flat_ground_truths,
+        extra_infos=flat_extras,
+        outcome_weight=0.0,
+        lambda_cot=0.0,
+        turn_level_process_reward=False,
+        **local_kwargs,
+    )
+
+    outputs: List[dict] = []
+    for parent_idx, indices in enumerate(parent_turn_indices):
+        rows = [turn_outputs[j] for j in indices]
+        trajectory_output = dict(trajectory_outputs[parent_idx])
+        outcome = float(trajectory_output.get("outcome_reward", 0.0))
+        turn_cot_rewards = [float(row.get("cot_reward", 0.0)) for row in rows]
+        turn_process_rewards = [float(lambda_cot) * value for value in turn_cot_rewards]
+
+        # Preserve validation/rubricator diagnostics from the complete
+        # trajectory pass; only process satisfaction and its token placement are
+        # local to turns.
+        trajectory_audit = trajectory_output.get("rubric_audit", {})
+        trajectory_output.pop("_rubric_proposal", None)
+        trajectory_output.pop("rubric_valid_flags", None)
+        trajectory_output.pop("rubric_correlations", None)
+        trajectory_output.update(
+            {
+                "score": float(outcome_weight) * outcome + float(sum(turn_process_rewards)),
+                "outcome_reward": outcome,
+                "cot_reward": float(sum(turn_cot_rewards)),
+                "turn_cot_rewards": turn_cot_rewards,
+                "turn_process_rewards": turn_process_rewards,
+                "turn_process_reward_positions": parent_positions[parent_idx],
+                "turn_process_reward_total": float(sum(turn_process_rewards)),
+                "turn_level_process_reward": 1.0,
+                "rubric_audit": {
+                    "trajectory_validation": trajectory_audit,
+                    "turns": [row.get("rubric_audit", {}) for row in rows],
+                },
+            }
+        )
+        outputs.append(trajectory_output)
+    return outputs
+
 def _compute_score_batched(
     *,
     data_sources,
@@ -1724,8 +1891,42 @@ def _compute_score_batched(
     corr_min_samples: int = 16,
     corr_calibration_interval: int = 10,
     corr_schema_version: str = "v1",
+    turn_level_process_reward: bool = True,
     **kwargs,
 ) -> List[dict]:
+    if turn_level_process_reward and not pure_outcome and any(
+        (extra or {}).get("turn_response_texts") for extra in extra_infos
+    ):
+        return _compute_score_batched_turn_level(
+            data_sources=data_sources,
+            solution_strs=solution_strs,
+            ground_truths=ground_truths,
+            extra_infos=extra_infos,
+            outcome_weight=outcome_weight,
+            lambda_cot=lambda_cot,
+            inner_kwargs={
+                "alpha": alpha,
+                "pure_outcome": False,
+                "rubricator": rubricator,
+                "verifier": verifier,
+                "fallback_to_heuristic": fallback_to_heuristic,
+                "normalize_rubric_weights": normalize_rubric_weights,
+                "ema_rule_corr_filter": ema_rule_corr_filter,
+                "insufficient_corr_policy": insufficient_corr_policy,
+                "alignment_target": alignment_target,
+                "trivial_rubric_cooldown": trivial_rubric_cooldown,
+                "trivial_rubric_scale": trivial_rubric_scale,
+                "alignment_rubricator_reward": alignment_rubricator_reward,
+                "rubric_validation_enabled": rubric_validation_enabled,
+                "rubric_audit": rubric_audit,
+                "corr_ema_beta": corr_ema_beta,
+                "corr_min_samples": corr_min_samples,
+                "corr_calibration_interval": corr_calibration_interval,
+                "corr_schema_version": corr_schema_version,
+                **kwargs,
+            },
+        )
+
     # Feature flags for backward compatibility:
     # - normalize_rubric_weights: clamp + L1-normalize rubric weights (default True)
     # - ema_rule_corr_filter: use historical rule correlation when group evidence is unavailable
@@ -1781,6 +1982,7 @@ def _compute_score_batched(
     for i in range(n):
         sol = str(solution_strs[i])
         extra = dict(extra_infos[i] or {})
+        extra.setdefault("data_source", data_sources[i])
         cot, final_answer = _extract_cot_and_answer(sol)
         q = _question_text(extra)
         gkey = _group_key(extra, i)
@@ -1809,7 +2011,7 @@ def _compute_score_batched(
                 "prompt_str": prompt_str,
                 "proposal": None,
                 "proposal_source": None,
-                "policy_proposal_raw": extra.get("rlcer_policy_rubric_raw", None),
+                "policy_proposal_raw": extra.get("gear_policy_rubric_raw", None),
                 "outcome": outcome,
                 "alignment_target": target,
                 "extra_info": extra,
@@ -1819,14 +2021,23 @@ def _compute_score_batched(
     # Build trajectory histories first, then resolve rubric proposals.
     # When rubricator_mode == "policy", precomputed rubrics from the training
     # loop (ray_trainer.py) are injected via batch.non_tensor_batch and passed
-    # through as extra_info["rlcer_policy_rubric_raw"].  We prefer these and
+    # through as extra_info["gear_policy_rubric_raw"].  We prefer these and
     # never call LLMRubricator again — the policy endpoint is already busy
     # serving rollout requests.  Missing / unparseable precomputed rubrics
     # fall back to HeuristicRubricator instead of a redundant LLM call.
     histories = _build_trajectory_history_for_items(items)
     for i in range(n):
+        # A turn-local pass must reuse the exact proposal that was validated on
+        # the full trajectory, including in external and heuristic modes.
+        prevalidated_proposal = items[i]["extra_info"].get(
+            "_prevalidated_rubric_proposal"
+        )
+        if isinstance(prevalidated_proposal, RubricProposal):
+            items[i]["proposal"] = prevalidated_proposal
+            items[i]["proposal_source"] = "trajectory_validation"
+            continue
+
         # 1) Try precomputed policy rubrics (from ray_trainer.py).
-        
         if rubricator_mode == "policy":
             precomputed = _extract_policy_rubric_proposal_from_extra(
                 extra_info=items[i].get("extra_info", {}),
@@ -1883,7 +2094,7 @@ def _compute_score_batched(
         group_to_indices.setdefault(x["group"], []).append(i)
 
     audit_step = _to_int_or_none(
-        items[0]["extra_info"].get("rlcer_global_step") if items else None
+        items[0]["extra_info"].get("gear_global_step") if items else None
     )
     audit_this_step = bool(
         audit_enabled
@@ -1920,6 +2131,10 @@ def _compute_score_batched(
     tracker_effective_ns = [0.0] * n
     tracker_observation_counts = [0.0] * n
     tracker_keys_by_item: List[List[str]] = [[] for _ in range(n)]
+    rubric_valid_flags_by_item: List[List[bool]] = [[] for _ in range(n)]
+    rubric_correlations_by_item: List[List[Optional[float]]] = [
+        [] for _ in range(n)
+    ]
     pending_tracker_updates: List[tuple[List[str], List[bool], float]] = []
     group_target_computable = [0.0] * n
     group_sizes = [0] * n
@@ -2073,20 +2288,52 @@ def _compute_score_batched(
                 for rid in rule_ids
             ]
             tracker_keys_by_item[i] = tracker_keys
-            correlation_flags, correlations, target_is_computable = _validate_rubric_correlations(
-                v_matrix=v_matrix,
-                z=z,
-                alpha=alpha,
-                rule_ids=tracker_keys,
-                ema_rule_corr_filter=ema_rule_corr_filter,
-                insufficient_corr_policy=insufficient_corr_policy,
-                corr_min_samples=corr_min_samples,
-            )
-            valid_flags = (
-                list(correlation_flags)
-                if rubric_validation_enabled
-                else [True] * len(criteria)
-            )
+            item_extra = items[i]["extra_info"]
+            if "_prevalidated_rubric_mask" in item_extra:
+                # Turn-local pass: reuse the acceptance decision made from the
+                # full trajectory comparison group. Never validate from local
+                # transition satisfaction vectors.
+                mask = [
+                    bool(x)
+                    for x in list(item_extra.get("_prevalidated_rubric_mask") or [])[
+                        : len(criteria)
+                    ]
+                ]
+                if len(mask) < len(criteria):
+                    mask.extend([False] * (len(criteria) - len(mask)))
+                passed_corrs = list(
+                    item_extra.get("_prevalidated_correlations") or []
+                )[: len(criteria)]
+                correlations = [
+                    None if value is None else float(value)
+                    for value in passed_corrs
+                ]
+                if len(correlations) < len(criteria):
+                    correlations.extend([None] * (len(criteria) - len(correlations)))
+                correlation_flags = list(mask)
+                valid_flags = list(mask)
+                target_is_computable = bool(
+                    item_extra.get("_prevalidated_target_is_computable", False)
+                )
+            else:
+                correlation_flags, correlations, target_is_computable = (
+                    _validate_rubric_correlations(
+                        v_matrix=v_matrix,
+                        z=z,
+                        alpha=alpha,
+                        rule_ids=tracker_keys,
+                        ema_rule_corr_filter=ema_rule_corr_filter,
+                        insufficient_corr_policy=insufficient_corr_policy,
+                        corr_min_samples=corr_min_samples,
+                    )
+                )
+                valid_flags = (
+                    list(correlation_flags)
+                    if rubric_validation_enabled
+                    else [True] * len(criteria)
+                )
+            rubric_valid_flags_by_item[i] = list(valid_flags)
+            rubric_correlations_by_item[i] = list(correlations)
             numeric_corrs = [float(c) for c in correlations if c is not None]
             valid_corrs = [
                 float(c)
@@ -2181,9 +2428,13 @@ def _compute_score_batched(
             # Correlation validation for every item in this invocation must see
             # exactly the same pre-batch tracker state.  Applying updates here
             # would make later items depend on the iteration order.
-            global_step = _to_int_or_none(items[i]["extra_info"].get("rlcer_global_step"))
+            global_step = _to_int_or_none(items[i]["extra_info"].get("gear_global_step"))
             calibration_step = global_step is None or global_step % corr_calibration_interval == 0
-            if ema_rule_corr_filter and calibration_step:
+            if (
+                ema_rule_corr_filter
+                and calibration_step
+                and not bool(items[i]["extra_info"].get("_skip_tracker_update", False))
+            ):
                 pending_tracker_updates.append(
                     (tracker_keys, sat_self, float(items[i]["alignment_target"]))
                 )
@@ -2335,6 +2586,10 @@ def _compute_score_batched(
                 bool(re.search(r"<answer>\s*.+?\s*</answer>", solution_strs[i], re.DOTALL | re.IGNORECASE))
             ),
         }
+        if bool(kwargs.get("_return_rubric_validation_details", False)):
+            output["_rubric_proposal"] = items[i]["proposal"]
+            output["rubric_valid_flags"] = list(rubric_valid_flags_by_item[i])
+            output["rubric_correlations"] = list(rubric_correlations_by_item[i])
         if audit_enabled:
             # Empty dictionaries keep validation aggregation from treating sparse
             # audit rows as numeric metrics.
@@ -2373,7 +2628,7 @@ def compute_score(
     extra_info=None,
     **kwargs,
 ):
-    """RLCER custom reward function.
+    """GEAR custom reward function.
     Supports both VERL batch reward-manager signature and single-item signature.
 
     Batch signature (recommended):

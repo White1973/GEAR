@@ -159,6 +159,12 @@ class AgentData:
         self.env_turns: int = 0
         self.turn_env_states: List[dict] = []
         self.initial_env_state: Optional[dict] = None
+        # Turn-aligned records used by GEAR to compute genuine process rewards.
+        self.turn_response_starts: List[int] = []
+        self.turn_response_ends: List[int] = []
+        self.turn_response_texts: List[str] = []
+        self.turn_images: List[Any] = []
+        self.turn_verifier_contexts: List[Dict[str, Any]] = []
         # Per-turn env-side quality metrics forwarded to reward_extra_info so
         # they reach wandb (aux/<env>/<key>). SVG env writes dino_score /
         # dreamsim_score into info each step; we keep the latest turn's value
@@ -364,6 +370,12 @@ class GymAgentLoop(AgentLoopBase):
                     "dino_score": float(agent_data.last_dino_score),
                     "dreamsim_score": float(agent_data.last_dreamsim_score),
                     "turn_env_states": agent_data.turn_env_states,
+                    "turn_response_starts": [min(int(x), self.response_length) for x in agent_data.turn_response_starts],
+                    "turn_response_ends": [min(int(x), self.response_length) for x in agent_data.turn_response_ends],
+                    "turn_response_texts": agent_data.turn_response_texts,
+                    "turn_images": agent_data.turn_images,
+                    "turn_env_rewards": agent_data.env_rewards,
+                    "turn_verifier_contexts": agent_data.turn_verifier_contexts,
                     "initial_env_state": agent_data.initial_env_state,
                     "verifier_context": agent_data.verifier_context,
                 },
@@ -431,10 +443,12 @@ class GymAgentLoop(AgentLoopBase):
             agent_data.metrics["mm/filtered_control_tokens"] = agent_data.metrics.get("mm/filtered_control_tokens", 0) + removed_mm_tokens
 
         agent_data.response_ids = filtered_response_ids
+        turn_response_start = len(agent_data.response_mask)
         if len(output.token_ids)>agent_data.response_limit:
             logger.warning(f"In env:{agent_data.env_name}, generated response length {len(output.token_ids)} exceeds per-turn response_limit {agent_data.response_limit}")
         agent_data.prompt_ids += agent_data.response_ids
         agent_data.response_mask += [1] * len(agent_data.response_ids)
+        turn_response_end = len(agent_data.response_mask)
         if output.log_probs:
             filtered_log_probs = [lp for lp, keep in zip(output.log_probs, keep_mask, strict=True) if keep]
             agent_data.response_logprobs += filtered_log_probs
@@ -444,6 +458,10 @@ class GymAgentLoop(AgentLoopBase):
             None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=True)
         )
         agent_data.last_assistant_text = assistant_message
+        agent_data.turn_response_starts.append(turn_response_start)
+        agent_data.turn_response_ends.append(turn_response_end)
+        agent_data.turn_response_texts.append(assistant_message)
+        agent_data.turn_images.append(agent_data.image_data[-1] if agent_data.image_data else None)
         safe_assistant_message = _sanitize_mm_placeholder_text(assistant_message)
         agent_data.messages.append({"role": "assistant", "content": safe_assistant_message})
         return AgentState.INTERACTING
@@ -471,8 +489,9 @@ class GymAgentLoop(AgentLoopBase):
         agent_data.env_rewards.append(float(reward))
         agent_data.traj_success = extract_success(info)
         agent_data.env_turns += 1
-        if "env_state" in info:
-            agent_data.turn_env_states.append(info["env_state"])
+        # Preserve one state/context slot per interaction turn.
+        agent_data.turn_env_states.append(info.get("env_state", {}))
+        agent_data.turn_verifier_contexts.append(dict(info.get("verifier_context", {}) or {}))
         # Forward env-side quality metrics (SVG dino_score / dreamsim_score).
         # Missing/non-numeric -> keep previous value (0.0 default).
         try:

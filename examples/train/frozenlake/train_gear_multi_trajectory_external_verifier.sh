@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sokoban RLCER using the trained Qwen2.5-VL LoRA verifier over HTTP.
+# FrozenLake GEAR using the trained Qwen2.5-VL LoRA verifier over HTTP.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -19,10 +19,10 @@ export VERIFIER_REQUEST_CONCURRENCY="${VERIFIER_REQUEST_CONCURRENCY:-16}"
 # The SFT target is a short JSON boolean list; 64 tokens leaves ample margin.
 export VERIFIER_MAX_TOKENS="${VERIFIER_MAX_TOKENS:-64}"
 export TRAINING_SEED="${TRAINING_SEED:-45}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-sokoban_rlcer_n8_external_trained_verifier_seed_${TRAINING_SEED}}"
-export CORR_SCHEMA_VERSION="${CORR_SCHEMA_VERSION:-sokoban_rlcer_n8_external_trained_verifier_v1}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-frozenlake_gear_n8_external_trained_verifier_seed_${TRAINING_SEED}}"
+export CORR_SCHEMA_VERSION="${CORR_SCHEMA_VERSION:-frozenlake_gear_n8_external_trained_verifier_v1}"
 
 if [[ "${SKIP_VERIFIER_CHECK:-0}" != 1 ]]; then
   bash "${BASE_DIR}/examples/deploy/verifier/check_qwen25_vl_3b.sh"
 fi
-exec "${SCRIPT_DIR}/run_rlcer_n8_rubric_test.sh"
+exec "${SCRIPT_DIR}/train_gear_multi_trajectory.sh"

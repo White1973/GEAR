@@ -337,7 +337,7 @@ class TaskRunner:
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
-        # For validation, enable pure_outcome mode to skip RLCER rubric computation
+        # For validation, enable pure_outcome mode to skip GEAR rubric computation
         val_cfg = deepcopy(config)
         OmegaConf.set_struct(val_cfg, False)
         try:

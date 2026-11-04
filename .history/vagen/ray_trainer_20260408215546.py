@@ -68,7 +68,7 @@ from vagen.custom_metric.metric import METRIC_REGISTRY
 from vagen.custom_filter.filter import FILTER_REGISTRY
 
 
-RLCER_POLICY_RUBRICATOR_PROMPT = (
+GEAR_POLICY_RUBRICATOR_PROMPT = (
     "You are a rubric designer. Given a task context and a solver response, "
     "generate JSON only with schema: "
     '{"rubrics": [{"criterion": str, "points": number}, ...]}. '
@@ -777,7 +777,7 @@ class RayPPOTrainer:
         reward_tensor[row_idx, col_idx] = scores
         return reward_tensor
 
-    def _build_rlcer_policy_rubricator_prompts(self, batch: DataProto) -> list[str]:
+    def _build_gear_policy_rubricator_prompts(self, batch: DataProto) -> list[str]:
         """Build rubricator prompts from current trajectories.
 
         These prompts are generated on driver side and sent to the SAME actor policy
@@ -798,14 +798,14 @@ class RayPPOTrainer:
         rubric_prompts: list[str] = []
         for p, r in zip(prompts, responses, strict=True):
             rubric_prompts.append(
-                f"{RLCER_POLICY_RUBRICATOR_PROMPT}\n\n"
+                f"{GEAR_POLICY_RUBRICATOR_PROMPT}\n\n"
                 f"[Task Context]\n{p}\n\n"
                 f"[Solver Response]\n{r}\n\n"
                 "Return JSON only."
             )
         return rubric_prompts
 
-    def _generate_rlcer_policy_rubrics_with_current_actor(self, batch: DataProto) -> list[str] | None:
+    def _generate_gear_policy_rubrics_with_current_actor(self, batch: DataProto) -> list[str] | None:
         """Generate rubric proposals using the CURRENT actor policy.
 
         This makes rubricator and solver share the same synchronized policy weights.
@@ -820,7 +820,7 @@ class RayPPOTrainer:
         if not use_actor_policy:
             return None
 
-        prompts = self._build_rlcer_policy_rubricator_prompts(batch)
+        prompts = self._build_gear_policy_rubricator_prompts(batch)
         if len(prompts) == 0:
             return []
 
@@ -864,7 +864,7 @@ class RayPPOTrainer:
             rubric_raws.append(self.tokenizer.decode(generated[i][:l], skip_special_tokens=True))
         return rubric_raws
 
-    def _build_rlcer_joint_training_batch(
+    def _build_gear_joint_training_batch(
         self,
         reasoner_batch: DataProto,
         reasoner_reward_tensor: torch.Tensor,
@@ -880,21 +880,21 @@ class RayPPOTrainer:
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         enable_dual_role_update = reward_cfg.get("enable_dual_role_update", False)
 
-        reasoner_batch.non_tensor_batch["rlcer_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
+        reasoner_batch.non_tensor_batch["gear_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
         if not enable_dual_role_update:
             return reasoner_batch
 
         rubricator_rewards = reward_extra_infos_dict.get("rubricator_reward", None)
         if rubricator_rewards is None:
-            metrics["rlcer/train/dual_role_skipped_no_rubricator_reward"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_rubricator_reward"] = 1.0
             return reasoner_batch
         if len(rubricator_rewards) != len(reasoner_batch):
-            metrics["rlcer/train/dual_role_skipped_len_mismatch"] = 1.0
+            metrics["gear/train/dual_role_skipped_len_mismatch"] = 1.0
             return reasoner_batch
 
         rubricator_scores = torch.tensor(rubricator_rewards, dtype=torch.float32, device=reasoner_reward_tensor.device)
         rubricator_batch = deepcopy(reasoner_batch)
-        rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
+        rubricator_batch.non_tensor_batch["gear_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
 
         rubricator_reward_tensor = self._build_terminal_reward_tensor_from_scores(rubricator_batch, rubricator_scores)
         rubricator_batch.batch["token_level_scores"] = rubricator_reward_tensor
@@ -917,10 +917,10 @@ class RayPPOTrainer:
 
         joint_batch = DataProto.concat([reasoner_batch, rubricator_batch])
 
-        metrics["rlcer/train/dual_role_enabled"] = 1.0
-        metrics["rlcer/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
+        metrics["gear/train/dual_role_enabled"] = 1.0
+        metrics["gear/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
         return joint_batch
 
     def _validate(self):
@@ -1578,14 +1578,14 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # RLCER policy-sync rubricator: generate rubric proposals with current actor policy.
+                        # GEAR policy-sync rubricator: generate rubric proposals with current actor policy.
                         try:
-                            rubric_raws = self._generate_rlcer_policy_rubrics_with_current_actor(batch)
+                            rubric_raws = self._generate_gear_policy_rubrics_with_current_actor(batch)
                             if rubric_raws is not None and len(rubric_raws) == len(batch):
-                                batch.non_tensor_batch["rlcer_policy_rubric_raw"] = np.array(rubric_raws, dtype=object)
+                                batch.non_tensor_batch["gear_policy_rubric_raw"] = np.array(rubric_raws, dtype=object)
                         except Exception as e:
-                            metrics["rlcer/train/policy_rubricator_generation_failed"] = 1.0
-                            print(f"[RLCER] policy rubricator generation failed: {e}")
+                            metrics["gear/train/policy_rubricator_generation_failed"] = 1.0
+                            print(f"[GEAR] policy rubricator generation failed: {e}")
 
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
@@ -1693,9 +1693,9 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
-                        # Optional RLCER dual-role optimization:
+                        # Optional GEAR dual-role optimization:
                         # append rubricator-role trajectories with role-specific rewards/advantages.
-                        batch = self._build_rlcer_joint_training_batch(
+                        batch = self._build_gear_joint_training_batch(
                             reasoner_batch=batch,
                             reasoner_reward_tensor=reward_tensor,
                             reward_extra_infos_dict=reward_extra_infos_dict,

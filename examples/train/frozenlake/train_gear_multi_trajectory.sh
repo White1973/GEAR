@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# 1200-step FrozenLake RLCER run for accepted/rejected rubric statistics.
+# 1200-step FrozenLake GEAR run for accepted/rejected rubric statistics.
 # Mirrors the corrected Sokoban n=8 long-run setup and writes a structured report.
 #
 # Examples:
-#   bash examples/train/frozenlake/run_rlcer_n8_rubric_test.sh
+#   bash examples/train/frozenlake/train_gear_multi_trajectory.sh
 #   TOTAL_STEPS=1200 CUDA_VISIBLE_DEVICES=2,3 N_GPUS=2 \
-#     bash examples/train/frozenlake/run_rlcer_n8_rubric_test.sh
+#     bash examples/train/frozenlake/train_gear_multi_trajectory.sh
 
 set -euo pipefail
 
@@ -17,11 +17,11 @@ TARGET_LABEL=${TARGET_LABEL:-FrozenLake trajectory success}
 ANALYSIS_DIR=${ANALYSIS_DIR:-${BASE_DIR}/examples/ablation/rubric_analysis/frozenlake}
 VERIFIER_MODE=${VERIFIER_MODE:-grounded}
 ALIGNMENT_TARGET=${ALIGNMENT_TARGET:-traj_success}
-CORR_SCHEMA_VERSION=${CORR_SCHEMA_VERSION:-frozenlake_rlcer_n8_rubric_long_v1}
+CORR_SCHEMA_VERSION=${CORR_SCHEMA_VERSION:-frozenlake_gear_n8_rubric_long_v1}
 
 TRAINING_SEED=${TRAINING_SEED:-44}
 PROJECT_NAME=${PROJECT_NAME:-jiayu_agent}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-frozenlake_rlcer_n8_rubric_long_v1_seed_${TRAINING_SEED}}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-frozenlake_gear_n8_rubric_long_v1_seed_${TRAINING_SEED}}
 EXPERIMENT_DIR=${EXPERIMENT_DIR:-${BASE_DIR}/exps/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 CHECKPOINT_DIR=${EXPERIMENT_DIR}/verl_checkpoints
 ROLLOUT_DIR=${EXPERIMENT_DIR}/rollout_data
@@ -71,7 +71,7 @@ fi
 
 mkdir -p "${EXPERIMENT_DIR}" "${ROLLOUT_DIR}" "${VALIDATION_DIR}"
 
-echo "Starting ${TASK_NAME} RLCER n=8 1200-step rubric run"
+echo "Starting ${TASK_NAME} GEAR n=8 1200-step rubric run"
 echo "  experiment=${PROJECT_NAME}/${EXPERIMENT_NAME}"
 echo "  steps=${TOTAL_STEPS}, train_batch=${TRAIN_BATCH_SIZE}, rollout.n=8"
 echo "  audit_interval=${AUDIT_INTERVAL}, corr_min_samples=${CORR_MIN_SAMPLES}"
@@ -130,7 +130,7 @@ CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     critic.model.fsdp_config.param_offload=true \
     critic.model.fsdp_config.optimizer_offload=true \
     reward_model.reward_manager=batch \
-    custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+    custom_reward_function.path=vagen/gear/reward_gear.py \
     custom_reward_function.name=compute_score \
     custom_reward_function.reward_kwargs.enable_dual_role_update=true \
     custom_reward_function.reward_kwargs.dual_role_strategy=shared_rho \

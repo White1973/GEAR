@@ -365,47 +365,6 @@ def _safe_json_extract(text: str) -> Optional[dict]:
         return None
 
 
-def _parse_rubric_proposal_from_raw(raw: str, max_rubrics: int) -> RubricProposal:
-    obj = _safe_json_extract(raw)
-    if not isinstance(obj, dict):
-        return RubricProposal(rubrics=[], format_ok=False, raw=raw)
-
-    rubrics_raw = obj.get("rubrics", [])
-    rubrics: List[Rubric] = []
-    for item in rubrics_raw:
-        if not isinstance(item, dict):
-            continue
-        # Support both legacy and new schema.
-        crit = str(item.get("criterion", item.get("description", ""))).strip()
-        pts = item.get("points", item.get("weight", 0))
-        if not crit:
-            continue
-        try:
-            pts = float(pts)
-        except Exception:
-            continue
-        if pts == 0:
-            continue
-        rubrics.append(Rubric(criterion=crit, points=pts))
-
-    return RubricProposal(rubrics=rubrics[: max_rubrics], format_ok=len(rubrics) > 0, raw=raw)
-
-
-def _extract_policy_rubric_proposal_from_extra(extra_info: dict, max_rubrics: int) -> Optional[RubricProposal]:
-    if not isinstance(extra_info, dict):
-        return None
-    raw = extra_info.get("rlcer_policy_rubric_raw", None)
-    if raw is None:
-        return None
-
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="ignore")
-    raw = str(raw)
-    if not raw.strip():
-        return RubricProposal(rubrics=[], format_ok=False, raw=raw)
-    return _parse_rubric_proposal_from_raw(raw=raw, max_rubrics=max_rubrics)
-
-
 def _extract_cot_and_answer(solution: str) -> tuple[str, str]:
     if solution is None:
         return "", ""
@@ -589,7 +548,29 @@ class LLMRubricator(BaseRubricator):
             }
 
         raw = self.client.chat([system_msg, user_msg], temperature=0.0, max_tokens=1500)
-        return _parse_rubric_proposal_from_raw(raw=raw, max_rubrics=self.max_rubrics)
+        obj = _safe_json_extract(raw)
+        if not isinstance(obj, dict):
+            return RubricProposal(rubrics=[], format_ok=False, raw=raw)
+
+        rubrics_raw = obj.get("rubrics", [])
+        rubrics: List[Rubric] = []
+        for item in rubrics_raw:
+            if not isinstance(item, dict):
+                continue
+            # Support both legacy and new schema.
+            crit = str(item.get("criterion", item.get("description", ""))).strip()
+            pts = item.get("points", item.get("weight", 0))
+            if not crit:
+                continue
+            try:
+                pts = float(pts)
+            except Exception:
+                continue
+            if pts == 0:
+                continue
+            rubrics.append(Rubric(criterion=crit, points=pts))
+
+        return RubricProposal(rubrics=rubrics[: self.max_rubrics], format_ok=len(rubrics) > 0, raw=raw)
 
 
 class LLMVerifier(BaseVerifier):
@@ -734,8 +715,6 @@ def _compute_score_batched(
     outcome_weight = float(outcome_weight)
     rubricator_cfg = rubricator or {}
     verifier_cfg = verifier or {}
-    rubricator_mode = str(rubricator_cfg.get("mode", "policy")).lower()
-    policy_max_rubrics = int(rubricator_cfg.get("max_rubrics", 8))
 
     rub = _build_rubricator(rubricator_cfg)
     ver = _build_verifier(verifier_cfg)
@@ -782,15 +761,6 @@ def _compute_score_batched(
     # Build trajectory histories first, then call rubricator with history-aware prompts.
     histories = _build_trajectory_history_for_items(items)
     for i in range(n):
-        if rubricator_mode == "policy":
-            precomputed = _extract_policy_rubric_proposal_from_extra(
-                extra_info=items[i].get("extra_info", {}),
-                max_rubrics=policy_max_rubrics,
-            )
-            if precomputed is not None and precomputed.format_ok and len(precomputed.rubrics) > 0:
-                items[i]["proposal"] = precomputed
-                continue
-
         try:
             items[i]["proposal"] = rub.generate(
                 question=items[i]["question"],
@@ -954,7 +924,7 @@ def compute_score(
     extra_info=None,
     **kwargs,
 ):
-    """RLCER custom reward function.
+    """GEAR custom reward function.
 
     Supports both VERL batch reward-manager signature and single-item signature.
 

@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import base64
-import io
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -27,155 +25,6 @@ NEGATIVE_CUE_WORDS = {
     "hallucinate",
     "hallucination",
 }
-
-
-NEW_SYSTEM_CONTENT = """
-# Role
-You are a Rubric Designer for Sokoban. Analyze the board image and generate evaluation rubrics.
-
-# Context
-## [System Rules] You are a Sokoban solver.
-Goal: Push all boxes onto targets.
-Symbols: # Wall | _ Floor | O Target | X Box | P You | √ Box on Target
-Rules: Push boxes only, avoid walls. Actions: Left, Down, Right, Up. Up to 3 actions per turn separated by comma.
-Response format: observation, think, answer, prediction.
-In observation and prediction, state each object position relative to player using exactly one vertical term (above, below, same row) and one horizontal term (left, right, same column).
-In answer, output 1 to 3 valid actions separated by comma.
-
-## [Trajectory History] None (Initial Turn)
-## [Current Visual State] [Provided via attached Image]
-
-STEP 1: Identify player, boxes, targets, and 2-cell obstacles. Classify moves as Illegal or Fatal with ALP ids. Compute freshness score where below 0.60 is fresh and above 0.85 is stale. Flag loops. Find best action and 2-step optimal sequence using distance delta. Trigger Pre-Target Alignment weight 15 if box is one push from target, or Push Side Positioning weight 6 if repositioning is needed.
-STEP 2: Generate rubrics in fixed order. Rule 1 Spatial Grounding weight 14. Rule 2 Action Legality weight 12 with veto. Rule 3 Logic Freshness weight 5. Rule 4 Strategic Progress weight 5 or 8. Rule 5 Push Side Positioning weight 6 if triggered. Rule 6 Pre-Target Alignment weight 15 if triggered.
-
-# OUTPUT FORMAT
-Return ONLY the JSON in a json block.
-
-{
-    "turn_id": "turn_000001",
-    "turn_analysis": {
-        "player_pos": [r, c],
-        "box_positions": [[r, c]],
-        "target_positions": [[r, c]],
-        "legal_actions": ["Dir"],
-        "between_check": "YES/NO",
-        "push_side_pos": [r, c],
-        "best_action": "Dir",
-        "optimal_seq": ["Dir", "Dir"],
-        "freshness_score": 0.0,
-        "summary": "one sentence summary"
-    },
-    "rubrics": [
-        {
-            "rule_id": "SPATIAL_GROUNDING",
-            "description": "Part a 4pts: observation states correct position for all objects, score 0 if wrong or missing. Part b 6pts: if BETWEEN is YES then think must contain detour keywords, score 0 if absent. Part c 4pts: if obstacle within 2 cells then think must name it, score 0 if unmentioned.",
-            "weight": 14
-        },
-        {
-            "rule_id": "ACTION_LEGALITY",
-            "description": "List each forbidden direction with ALP id and reason, score 0 if answer uses it. Fail collapses all other scores to 0.",
-            "weight": 12
-        },
-        {
-            "rule_id": "LOGIC_FRESHNESS",
-            "description": "PASS if freshness below 0.60, PARTIAL if 0.60 to 0.85, FAIL if above 0.85. FAIL if 3 or more turns share over 85 percent overlap. PASS on loop only if think proposes new plan.",
-            "weight": 5
-        },
-        {
-            "rule_id": "STRATEGIC_PROGRESS",
-            "description": "PASS if delta positive. PASS if delta zero and reposition justified. PASS if delta negative only when detour justified. First action must match optimal sequence. If plan depth needed then think must name at least 2 steps.",
-            "weight": 5
-        }
-    ]
-}
-""".strip()
-
-
-USER_CONTENT = """[Initial Observation]:
-<image>
-Analyze the current Sokoban board state and generate evaluation rubrics."""
-
-
-def _to_int_or_none(x: Any) -> Optional[int]:
-    try:
-        if x is None:
-            return None
-        return int(x)
-    except Exception:
-        return None
-
-
-def _format_history_items(items: List[dict], max_items: int = 4, max_chars: int = 1600) -> str:
-    if len(items) == 0:
-        return "None (Initial Turn)"
-
-    trimmed = items[-max_items:]
-    blocks: List[str] = []
-    for it in trimmed:
-        tid = it.get("turn_idx")
-        ans = str(it.get("answer", "")).strip()
-        cot = str(it.get("cot", "")).strip()
-        if len(cot) > 240:
-            cot = cot[:240] + "..."
-        blocks.append(f"Turn {tid}: answer={ans}; cot={cot}")
-
-    text = "\n".join(blocks)
-    if len(text) > max_chars:
-        text = text[-max_chars:]
-    return text
-
-
-def _build_trajectory_history_for_items(items: List[dict]) -> List[str]:
-    """Build per-sample trajectory history from batch trajectories.
-
-    Priority:
-    1) Same (group, traj_idx) and previous turn_idx samples in current batch
-    2) Fallback to decoded prompt_str from training sample
-    """
-    group_traj_to_indices: Dict[tuple[str, Any], List[int]] = {}
-    for i, x in enumerate(items):
-        key = (x["group"], x.get("traj_idx"))
-        group_traj_to_indices.setdefault(key, []).append(i)
-
-    histories = ["None (Initial Turn)"] * len(items)
-    for _, idxs in group_traj_to_indices.items():
-        idxs_sorted = sorted(
-            idxs,
-            key=lambda t: (
-                items[t].get("turn_idx") if items[t].get("turn_idx") is not None else 10**9,
-                t,
-            ),
-        )
-
-        prev_items: List[dict] = []
-        for t in idxs_sorted:
-            cur_turn = items[t].get("turn_idx")
-            if cur_turn is None:
-                # Unknown turn index: fallback to prompt text directly
-                prompt_str = str(items[t].get("prompt_str", "")).strip()
-                histories[t] = prompt_str if prompt_str else "None (Initial Turn)"
-                continue
-
-            hist = _format_history_items(prev_items)
-            histories[t] = hist
-            prev_items.append(items[t])
-
-    # final fallback for any empty history
-    for i in range(len(items)):
-        if not histories[i] or histories[i] == "None (Initial Turn)":
-            prompt_str = str(items[i].get("prompt_str", "")).strip()
-            if prompt_str:
-                histories[i] = prompt_str
-    return histories
-
-
-def _compose_rubricator_system_content(trajectory_history: str) -> str:
-    history_text = trajectory_history.strip() if trajectory_history else "None (Initial Turn)"
-    marker = "## [Trajectory History] None (Initial Turn)"
-    if marker in NEW_SYSTEM_CONTENT:
-        return NEW_SYSTEM_CONTENT.replace(marker, f"## [Trajectory History] {history_text}")
-    # robust fallback
-    return NEW_SYSTEM_CONTENT + f"\n\n## [Trajectory History] {history_text}"
 
 
 @dataclass
@@ -317,35 +166,6 @@ class OpenAICompatibleClient:
         return obj["choices"][0]["message"]["content"]
 
 
-def _pil_to_data_url(image: Any, image_format: str = "PNG") -> Optional[str]:
-    try:
-        from PIL import Image
-
-        if not isinstance(image, Image.Image):
-            return None
-        buf = io.BytesIO()
-        image.save(buf, format=image_format)
-        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-        mime = "image/png" if image_format.upper() == "PNG" else "image/jpeg"
-        return f"data:{mime};base64,{b64}"
-    except Exception:
-        return None
-
-
-def _extract_first_image_from_kwargs(kwargs: dict) -> Any:
-    extra = kwargs.get("extra_info") or {}
-    # priority: explicit field
-    if "image" in extra:
-        return extra.get("image")
-    # common vagen field from agent-loop extra_fields
-    if "image_data" in extra:
-        img_data = extra.get("image_data")
-        if isinstance(img_data, list) and len(img_data) > 0:
-            return img_data[0]
-        return img_data
-    return None
-
-
 class LLMRubricator(BaseRubricator):
     def __init__(self, cfg: dict):
         self.client = OpenAICompatibleClient(
@@ -357,52 +177,18 @@ class LLMRubricator(BaseRubricator):
         self.max_rubrics = int(cfg.get("max_rubrics", 8))
 
     def generate(self, question: str, response: str, cot: str, **kwargs) -> RubricProposal:
-        image = _extract_first_image_from_kwargs(kwargs)
-        image_url = _pil_to_data_url(image)
-
-        trajectory_history = str(kwargs.get("trajectory_history", "") or "None (Initial Turn)")
-        turn_idx = kwargs.get("turn_idx", None)
-        if turn_idx is None:
-            turn_id = "turn_000001"
-        else:
-            turn_id = f"turn_{int(turn_idx):06d}" if _to_int_or_none(turn_idx) is not None else "turn_000001"
-
-        system_msg = {
-            "role": "system",
-            "content": _compose_rubricator_system_content(trajectory_history),
+        prompt = {
+            "role": "user",
+            "content": (
+                "Generate JSON only.\n"
+                "Schema: {\"rubrics\": [{\"criterion\": str, \"points\": number}, ...]}\n"
+                f"Give 4-{self.max_rubrics} binary-evaluable rubrics for assessing reasoning quality.\n"
+                "Use both positive and negative points (-5..5, non-zero).\n"
+                f"Question:\n{question}\n\n"
+                f"Response:\n{response}\n"
+            ),
         }
-
-        if image_url is not None:
-            user_content = [
-                {"type": "text", "text": USER_CONTENT},
-                {"type": "image_url", "image_url": {"url": image_url}},
-                {
-                    "type": "text",
-                    "text": (
-                        f"\n[Turn ID]\n{turn_id}\n"
-                        f"\n[Question]\n{question or ''}\n"
-                        f"\n[Solver Response]\n{response or ''}\n"
-                        f"\n[Extracted CoT]\n{cot or ''}\n"
-                        f"\n[Constraint]\nKeep at most {self.max_rubrics} rubrics in the output list."
-                    ),
-                },
-            ]
-            user_msg = {"role": "user", "content": user_content}
-        else:
-            user_msg = {
-                "role": "user",
-                "content": (
-                    f"{USER_CONTENT}\n\n"
-                    "[No image attached in this call. Use text fallback.]\n"
-                    f"[Turn ID]\n{turn_id}\n"
-                    f"[Question]\n{question or ''}\n"
-                    f"[Solver Response]\n{response or ''}\n"
-                    f"[Extracted CoT]\n{cot or ''}\n"
-                    f"[Constraint]\nKeep at most {self.max_rubrics} rubrics in the output list."
-                ),
-            }
-
-        raw = self.client.chat([system_msg, user_msg], temperature=0.0, max_tokens=1500)
+        raw = self.client.chat([prompt], temperature=0.0, max_tokens=1200)
         obj = _safe_json_extract(raw)
         if not isinstance(obj, dict):
             return RubricProposal(rubrics=[], format_ok=False, raw=raw)
@@ -412,9 +198,8 @@ class LLMRubricator(BaseRubricator):
         for item in rubrics_raw:
             if not isinstance(item, dict):
                 continue
-            # Support both legacy and new schema.
-            crit = str(item.get("criterion", item.get("description", ""))).strip()
-            pts = item.get("points", item.get("weight", 0))
+            crit = str(item.get("criterion", "")).strip()
+            pts = item.get("points", 0)
             if not crit:
                 continue
             try:
@@ -582,12 +367,9 @@ def _compute_score_batched(
         cot, final_answer = _extract_cot_and_answer(sol)
         q = _question_text(extra)
         gkey = _group_key(extra, i)
-        traj_idx = extra.get("traj_idx", None)
-        turn_idx = _to_int_or_none(extra.get("turn_idx", None))
-        prompt_str = extra.get("prompt_str", "")
 
         try:
-            proposal = RubricProposal(rubrics=[], format_ok=False, raw="pending")
+            proposal = rub.generate(question=q, response=sol, cot=cot)
         except Exception:
             if not fallback_to_heuristic:
                 proposal = RubricProposal(rubrics=[], format_ok=False, raw="rubricator_error")
@@ -604,36 +386,10 @@ def _compute_score_batched(
                 "solution": sol,
                 "cot": cot,
                 "answer": final_answer,
-                "traj_idx": traj_idx,
-                "turn_idx": turn_idx,
-                "prompt_str": prompt_str,
                 "proposal": proposal,
                 "outcome": outcome,
-                "extra_info": extra,
             }
         )
-
-    # Build trajectory histories first, then call rubricator with history-aware prompts.
-    histories = _build_trajectory_history_for_items(items)
-    for i in range(n):
-        try:
-            items[i]["proposal"] = rub.generate(
-                question=items[i]["question"],
-                response=items[i]["solution"],
-                cot=items[i]["cot"],
-                trajectory_history=histories[i],
-                turn_idx=items[i].get("turn_idx", None),
-                extra_info=items[i].get("extra_info", {}),
-            )
-        except Exception:
-            if not fallback_to_heuristic:
-                items[i]["proposal"] = RubricProposal(rubrics=[], format_ok=False, raw="rubricator_error")
-            else:
-                items[i]["proposal"] = HeuristicRubricator().generate(
-                    question=items[i]["question"],
-                    response=items[i]["solution"],
-                    cot=items[i]["cot"],
-                )
 
     group_to_indices: Dict[str, List[int]] = {}
     for i, x in enumerate(items):
@@ -779,7 +535,7 @@ def compute_score(
     extra_info=None,
     **kwargs,
 ):
-    """RLCER custom reward function.
+    """GEAR custom reward function.
 
     Supports both VERL batch reward-manager signature and single-item signature.
 

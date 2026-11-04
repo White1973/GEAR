@@ -1,4 +1,4 @@
-"""Shared prompt templates for RLCER rubric generation."""
+"""Shared prompt templates for GEAR rubric generation."""
 
 # Core physical-law rule IDs that must always appear in generated rubrics.
 CORE_RULE_IDS = {
@@ -130,8 +130,8 @@ USER_CONTENT = """[Initial Observation]:
 Analyze the current Sokoban board state and generate evaluation rubrics."""
 
 # Backward/explicit aliases for trainer-side naming.
-RLCER_RUBRICATOR_SYSTEM_PROMPT = NEW_SYSTEM_CONTENT
-RLCER_RUBRICATOR_USER_PROMPT = USER_CONTENT
+GEAR_RUBRICATOR_SYSTEM_PROMPT = NEW_SYSTEM_CONTENT
+GEAR_RUBRICATOR_USER_PROMPT = USER_CONTENT
 
 
 FROZENLAKE_RUBRICATOR_SYSTEM_PROMPT = """
@@ -200,3 +200,123 @@ Return ONLY JSON in a json code block:
 FROZENLAKE_RUBRICATOR_USER_PROMPT = """[Current FrozenLake Observation]:
 <image>
 Analyze the current FrozenLake state and generate evaluation rubrics."""
+
+NAVIGATION_RUBRICATOR_SYSTEM_PROMPT = """
+# Role
+You are a Rubric Designer for embodied visual navigation. Analyze the current
+first-person observation, navigation instruction, interaction history, and
+solver response to generate grounded, discriminative process rubrics.
+
+# Environment
+Valid actions are move_forward, move_backward, move_right, move_left,
+turn_right, turn_left, look_up, and look_down. A response may contain several
+actions. Evaluate reasoning and the proposed transition, not final success.
+
+# Required rubric slots
+Return exactly these four rule_ids in this order:
+1. SPATIAL_GROUNDING: check a concrete visual relation involving the target,
+   obstacle, free space, viewpoint, or motion direction.
+2. ACTION_LEGALITY: check that the action sequence is executable, correctly
+   formatted, and avoids a visible obstacle or a repeated failed direction.
+3. LOGIC_FRESHNESS: check that reasoning incorporates the newest observation
+   and feedback rather than repeating a stale pose, target belief, or action.
+4. STRATEGIC_PROGRESS: check that the transition improves target visibility or
+   plausible distance to the destination without an unsupported detour.
+
+# Requirements
+- Tailor every criterion to this observation, instruction, response, and history.
+- Use one atomic criterion with explicit "PASS if ...; FAIL if ..." conditions.
+- Judge observable reasoning, actions, or the resulting local transition.
+- Never auto-pass an initial turn or use final success as a criterion.
+- If the target location is uncertain, require a justified look/rotation action.
+
+# Weights
+Use finite weights in [-20, 20]. Positive weights express useful grounded
+behavior and will be normalized to sum to one before scoring. Use a negative
+weight only for a concrete harmful flaw. Give larger magnitude to collision
+avoidance and actions decisive for the current instruction.
+
+# Output
+Return only JSON with keys turn_id, turn_analysis, and rubrics. Each rubric item
+must contain rule_id, description, and weight.
+""".strip()
+
+NAVIGATION_RUBRICATOR_USER_PROMPT = """[Current Navigation Observation]:
+<image>
+Analyze the instruction, current view, history, and solver response, then
+generate the four required grounded navigation rubrics."""
+
+
+SVG_RUBRICATOR_SYSTEM_PROMPT = """
+# Role
+You are a Rubric Designer for iterative SVG reconstruction. Analyze the target
+image, current solver response containing SVG markup, and prior interaction
+feedback to generate grounded, discriminative process rubrics.
+
+# Environment
+The solver must produce valid SVG/XML that reconstructs the target icon. The
+local transition is the rasterized image produced by the submitted SVG. Evaluate
+properties visible in the target/generated comparison and submitted structure,
+not the final aggregate environment reward itself.
+
+# Required rubric slots
+Return exactly these four rule_ids in this order:
+1. SVG_VALIDITY: check for parseable, renderable SVG with a valid root/viewBox
+   and no malformed or unsupported structure.
+2. LAYOUT_ALIGNMENT: check a target-specific placement, scale, proportion,
+   orientation, or negative-space relation.
+3. COLOR_ALIGNMENT: check a target-specific fill/stroke color, contrast, or
+   foreground/background assignment.
+4. STRUCTURAL_ALIGNMENT: check a target-specific shape/element composition,
+   contour, layering, repetition count, or primitive choice.
+
+# Requirements
+- Tailor every criterion to concrete target evidence and candidate transition.
+- Use one checkable criterion with explicit "PASS if ...; FAIL if ..." terms.
+- Never use vague claims such as good, similar, complete, or successful.
+- Do not auto-pass valid syntax; validity and visual alignment are separate.
+- On later turns, require a correction grounded in the newest rendered result.
+
+# Weights
+Use finite weights in [-20, 20]. Positive weights will be normalized to sum to
+one before scoring. Use negative weights only for an explicit defect. Give
+SVG_VALIDITY enough importance to prevent unrenderable outputs, then allocate
+remaining importance according to the most salient target mismatch.
+
+# Output
+Return only JSON with keys turn_id, turn_analysis, and rubrics. Each rubric item
+must contain rule_id, description, and weight.
+""".strip()
+
+SVG_RUBRICATOR_USER_PROMPT = """[Target SVG Observation]:
+<image>
+Analyze the target icon, current SVG response, and interaction history, then
+generate the four required grounded reconstruction rubrics."""
+
+
+def get_rubricator_prompts(data_source):
+    """Return task-specific policy-rubricator prompts and task instruction."""
+    source = str(data_source or "").lower()
+    if "frozenlake" in source:
+        return (
+            FROZENLAKE_RUBRICATOR_SYSTEM_PROMPT,
+            FROZENLAKE_RUBRICATOR_USER_PROMPT,
+            "Analyze the current FrozenLake board state and generate evaluation rubrics.",
+        )
+    if "navigation" in source:
+        return (
+            NAVIGATION_RUBRICATOR_SYSTEM_PROMPT,
+            NAVIGATION_RUBRICATOR_USER_PROMPT,
+            "Analyze the current embodied navigation state and generate evaluation rubrics.",
+        )
+    if "svg" in source:
+        return (
+            SVG_RUBRICATOR_SYSTEM_PROMPT,
+            SVG_RUBRICATOR_USER_PROMPT,
+            "Analyze the target and current SVG reconstruction and generate evaluation rubrics.",
+        )
+    return (
+        GEAR_RUBRICATOR_SYSTEM_PROMPT,
+        GEAR_RUBRICATOR_USER_PROMPT,
+        "Analyze the current Sokoban board state and generate evaluation rubrics.",
+    )

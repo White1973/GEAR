@@ -96,6 +96,233 @@ USER_CONTENT = """[Initial Observation]:
 Analyze the current Sokoban board state and generate evaluation rubrics."""
 
 
+def _to_int_or_none(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _format_history_items(items: List[dict], max_items: int = 4, max_chars: int = 1600) -> str:
+    if len(items) == 0:
+        return "None (Initial Turn)"
+
+    trimmed = items[-max_items:]
+    blocks: List[str] = []
+    for it in trimmed:
+        tid = it.get("turn_idx")
+        structured = _extract_structured_sections(str(it.get("solution", "")))
+        blocks.append(
+            "\n".join(
+                [
+                    f"[Turn {tid}]",
+                    "observation:",
+                    structured["observation"],
+                    "think:",
+                    structured["think"],
+                    "answer:",
+                    structured["answer"],
+                    "prediction:",
+                    structured["prediction"],
+                ]
+            )
+        )
+
+    text = "\n\n".join(blocks)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+def _extract_structured_sections(solution: str) -> Dict[str, str]:
+    """Parse solver response into observation/think/answer/prediction sections.
+
+    Strict section names are preferred. Falls back to robust heuristics if sections
+    are partially missing.
+    """
+    s = (solution or "").strip()
+    if not s:
+        return {"observation": "", "think": "", "answer": "", "prediction": ""}
+
+    # Normalize full-width colon for robustness.
+    s = s.replace("：", ":")
+    lower = s.lower()
+
+    # Candidate heading aliases mapped to canonical key.
+    heading_aliases = {
+        "observation": ["observation", "观察", "obs"],
+        "think": ["think", "reasoning", "thought", "思考", "analysis"],
+        "answer": ["answer", "action", "动作", "结论"],
+        "prediction": ["prediction", "predict", "预测"],
+    }
+
+    # Locate first occurrence of each canonical heading.
+    positions: List[tuple[int, str, int]] = []
+    for key, aliases in heading_aliases.items():
+        best_pos = None
+        best_len = 0
+        for a in aliases:
+            m = re.search(rf"(?im)(^|\n)\s*(?:\[?\s*){re.escape(a)}\s*\]?\s*:\s*", lower)
+            if m is not None:
+                p = m.start()
+                if best_pos is None or p < best_pos:
+                    best_pos = p
+                    best_len = len(m.group(0))
+        if best_pos is not None:
+            positions.append((best_pos, key, best_len))
+
+    positions.sort(key=lambda x: x[0])
+    out = {"observation": "", "think": "", "answer": "", "prediction": ""}
+
+    if positions:
+        for i, (start, key, hlen) in enumerate(positions):
+            body_start = start + hlen
+            body_end = positions[i + 1][0] if i + 1 < len(positions) else len(s)
+            content = s[body_start:body_end].strip()
+            out[key] = content
+
+    # Fallbacks if headings are missing
+    if not out["answer"]:
+        _, ans = _extract_cot_and_answer(s)
+        out["answer"] = ans
+    if not out["think"]:
+        out["think"] = s[:500]
+    if not out["observation"]:
+        out["observation"] = "(not explicitly provided)"
+    if not out["prediction"]:
+        out["prediction"] = "(not explicitly provided)"
+
+    # Keep sections concise for prompt budget
+    for k in out.keys():
+        if len(out[k]) > 600:
+            out[k] = out[k][:600] + "..."
+    return out
+
+
+def _extract_concat_turn_candidates(text: str, max_turns: int = 6) -> List[Dict[str, str]]:
+    """Best-effort extraction of multiple structured turns from concat-mode text."""
+    s = (text or "").replace("：", ":")
+    if not s.strip():
+        return []
+
+    # Split by repeated observation heading as turn boundary.
+    chunks = re.split(r"(?im)(?=^\s*\[?\s*observation\s*\]?\s*:)", s)
+    turns: List[Dict[str, str]] = []
+    for c in chunks:
+        c = c.strip()
+        if not c:
+            continue
+        sec = _extract_structured_sections(c)
+        # require at least one non-fallback signal
+        if sec["answer"] or sec["think"]:
+            turns.append(sec)
+    if len(turns) > max_turns:
+        turns = turns[-max_turns:]
+    return turns
+
+
+def _format_structured_history_from_sections(sections: List[Dict[str, str]], max_chars: int = 1800) -> str:
+    if not sections:
+        return "None (Initial Turn)"
+    blocks: List[str] = []
+    for i, sec in enumerate(sections, start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"[Turn {i}]",
+                    "observation:",
+                    sec.get("observation", ""),
+                    "think:",
+                    sec.get("think", ""),
+                    "answer:",
+                    sec.get("answer", ""),
+                    "prediction:",
+                    sec.get("prediction", ""),
+                ]
+            )
+        )
+    text = "\n\n".join(blocks)
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    return text
+
+
+def _build_trajectory_history_for_items(items: List[dict]) -> List[str]:
+    """Build per-sample trajectory history from batch trajectories.
+
+    Priority:
+    1) Same (group, traj_idx) and previous turn_idx samples in current batch
+    2) Fallback to decoded prompt_str from training sample
+    """
+    group_traj_to_indices: Dict[tuple[str, Any], List[int]] = {}
+    for i, x in enumerate(items):
+        key = (x["group"], x.get("traj_idx"))
+        group_traj_to_indices.setdefault(key, []).append(i)
+
+    histories = ["None (Initial Turn)"] * len(items)
+
+    # Detect mode: if turn_idx is mostly available, treat as no-concat.
+    has_turn = sum(1 for x in items if x.get("turn_idx") is not None)
+    no_concat_mode = has_turn >= max(1, len(items) // 2)
+
+    if not no_concat_mode:
+        # Concat-mode optimization: derive history from serialized text of each sample.
+        for i, x in enumerate(items):
+            combined_text = f"{x.get('prompt_str', '')}\n{x.get('solution', '')}"
+            turns = _extract_concat_turn_candidates(combined_text)
+            # For current rubric generation, history should be previous turns only.
+            if len(turns) >= 2:
+                histories[i] = _format_structured_history_from_sections(turns[:-1])
+            elif len(turns) == 1:
+                histories[i] = "None (Initial Turn)"
+            else:
+                prompt_str = str(x.get("prompt_str", "")).strip()
+                histories[i] = prompt_str if prompt_str else "None (Initial Turn)"
+        return histories
+
+    # no-concat mode: use prior turns from same (group, traj_idx).
+    for _, idxs in group_traj_to_indices.items():
+        idxs_sorted = sorted(
+            idxs,
+            key=lambda t: (
+                items[t].get("turn_idx") if items[t].get("turn_idx") is not None else 10**9,
+                t,
+            ),
+        )
+
+        prev_items: List[dict] = []
+        for t in idxs_sorted:
+            cur_turn = items[t].get("turn_idx")
+            if cur_turn is None:
+                # Unknown turn index: fallback to prompt text directly
+                prompt_str = str(items[t].get("prompt_str", "")).strip()
+                histories[t] = prompt_str if prompt_str else "None (Initial Turn)"
+                continue
+
+            hist = _format_history_items(prev_items)
+            histories[t] = hist
+            prev_items.append(items[t])
+
+    # final fallback for any empty history
+    for i in range(len(items)):
+        if not histories[i] or histories[i] == "None (Initial Turn)":
+            prompt_str = str(items[i].get("prompt_str", "")).strip()
+            if prompt_str:
+                histories[i] = prompt_str
+    return histories
+
+
+def _compose_rubricator_system_content(trajectory_history: str) -> str:
+    history_text = trajectory_history.strip() if trajectory_history else "None (Initial Turn)"
+    marker = "## [Trajectory History] None (Initial Turn)"
+    if marker in NEW_SYSTEM_CONTENT:
+        return NEW_SYSTEM_CONTENT.replace(marker, f"## [Trajectory History] {history_text}")
+    # robust fallback
+    return NEW_SYSTEM_CONTENT + f"\n\n## [Trajectory History] {history_text}"
+
+
 @dataclass
 class Rubric:
     criterion: str
@@ -136,6 +363,47 @@ def _safe_json_extract(text: str) -> Optional[dict]:
         return json.loads(candidate)
     except Exception:
         return None
+
+
+def _parse_rubric_proposal_from_raw(raw: str, max_rubrics: int) -> RubricProposal:
+    obj = _safe_json_extract(raw)
+    if not isinstance(obj, dict):
+        return RubricProposal(rubrics=[], format_ok=False, raw=raw)
+
+    rubrics_raw = obj.get("rubrics", [])
+    rubrics: List[Rubric] = []
+    for item in rubrics_raw:
+        if not isinstance(item, dict):
+            continue
+        # Support both legacy and new schema.
+        crit = str(item.get("criterion", item.get("description", ""))).strip()
+        pts = item.get("points", item.get("weight", 0))
+        if not crit:
+            continue
+        try:
+            pts = float(pts)
+        except Exception:
+            continue
+        if pts == 0:
+            continue
+        rubrics.append(Rubric(criterion=crit, points=pts))
+
+    return RubricProposal(rubrics=rubrics[: max_rubrics], format_ok=len(rubrics) > 0, raw=raw)
+
+
+def _extract_policy_rubric_proposal_from_extra(extra_info: dict, max_rubrics: int) -> Optional[RubricProposal]:
+    if not isinstance(extra_info, dict):
+        return None
+    raw = extra_info.get("gear_policy_rubric_raw", None)
+    if raw is None:
+        return None
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    raw = str(raw)
+    if not raw.strip():
+        return RubricProposal(rubrics=[], format_ok=False, raw=raw)
+    return _parse_rubric_proposal_from_raw(raw=raw, max_rubrics=max_rubrics)
 
 
 def _extract_cot_and_answer(solution: str) -> tuple[str, str]:
@@ -278,9 +546,16 @@ class LLMRubricator(BaseRubricator):
         image = _extract_first_image_from_kwargs(kwargs)
         image_url = _pil_to_data_url(image)
 
+        trajectory_history = str(kwargs.get("trajectory_history", "") or "None (Initial Turn)")
+        turn_idx = kwargs.get("turn_idx", None)
+        if turn_idx is None:
+            turn_id = "turn_000001"
+        else:
+            turn_id = f"turn_{int(turn_idx):06d}" if _to_int_or_none(turn_idx) is not None else "turn_000001"
+
         system_msg = {
             "role": "system",
-            "content": NEW_SYSTEM_CONTENT,
+            "content": _compose_rubricator_system_content(trajectory_history),
         }
 
         if image_url is not None:
@@ -290,6 +565,7 @@ class LLMRubricator(BaseRubricator):
                 {
                     "type": "text",
                     "text": (
+                        f"\n[Turn ID]\n{turn_id}\n"
                         f"\n[Question]\n{question or ''}\n"
                         f"\n[Solver Response]\n{response or ''}\n"
                         f"\n[Extracted CoT]\n{cot or ''}\n"
@@ -304,6 +580,7 @@ class LLMRubricator(BaseRubricator):
                 "content": (
                     f"{USER_CONTENT}\n\n"
                     "[No image attached in this call. Use text fallback.]\n"
+                    f"[Turn ID]\n{turn_id}\n"
                     f"[Question]\n{question or ''}\n"
                     f"[Solver Response]\n{response or ''}\n"
                     f"[Extracted CoT]\n{cot or ''}\n"
@@ -312,29 +589,7 @@ class LLMRubricator(BaseRubricator):
             }
 
         raw = self.client.chat([system_msg, user_msg], temperature=0.0, max_tokens=1500)
-        obj = _safe_json_extract(raw)
-        if not isinstance(obj, dict):
-            return RubricProposal(rubrics=[], format_ok=False, raw=raw)
-
-        rubrics_raw = obj.get("rubrics", [])
-        rubrics: List[Rubric] = []
-        for item in rubrics_raw:
-            if not isinstance(item, dict):
-                continue
-            # Support both legacy and new schema.
-            crit = str(item.get("criterion", item.get("description", ""))).strip()
-            pts = item.get("points", item.get("weight", 0))
-            if not crit:
-                continue
-            try:
-                pts = float(pts)
-            except Exception:
-                continue
-            if pts == 0:
-                continue
-            rubrics.append(Rubric(criterion=crit, points=pts))
-
-        return RubricProposal(rubrics=rubrics[: self.max_rubrics], format_ok=len(rubrics) > 0, raw=raw)
+        return _parse_rubric_proposal_from_raw(raw=raw, max_rubrics=self.max_rubrics)
 
 
 class LLMVerifier(BaseVerifier):
@@ -479,6 +734,8 @@ def _compute_score_batched(
     outcome_weight = float(outcome_weight)
     rubricator_cfg = rubricator or {}
     verifier_cfg = verifier or {}
+    rubricator_mode = str(rubricator_cfg.get("mode", "policy")).lower()
+    policy_max_rubrics = int(rubricator_cfg.get("max_rubrics", 8))
 
     rub = _build_rubricator(rubricator_cfg)
     ver = _build_verifier(verifier_cfg)
@@ -491,9 +748,12 @@ def _compute_score_batched(
         cot, final_answer = _extract_cot_and_answer(sol)
         q = _question_text(extra)
         gkey = _group_key(extra, i)
+        traj_idx = extra.get("traj_idx", None)
+        turn_idx = _to_int_or_none(extra.get("turn_idx", None))
+        prompt_str = extra.get("prompt_str", "")
 
         try:
-            proposal = rub.generate(question=q, response=sol, cot=cot)
+            proposal = RubricProposal(rubrics=[], format_ok=False, raw="pending")
         except Exception:
             if not fallback_to_heuristic:
                 proposal = RubricProposal(rubrics=[], format_ok=False, raw="rubricator_error")
@@ -510,10 +770,45 @@ def _compute_score_batched(
                 "solution": sol,
                 "cot": cot,
                 "answer": final_answer,
+                "traj_idx": traj_idx,
+                "turn_idx": turn_idx,
+                "prompt_str": prompt_str,
                 "proposal": proposal,
                 "outcome": outcome,
+                "extra_info": extra,
             }
         )
+
+    # Build trajectory histories first, then call rubricator with history-aware prompts.
+    histories = _build_trajectory_history_for_items(items)
+    for i in range(n):
+        if rubricator_mode == "policy":
+            precomputed = _extract_policy_rubric_proposal_from_extra(
+                extra_info=items[i].get("extra_info", {}),
+                max_rubrics=policy_max_rubrics,
+            )
+            if precomputed is not None and precomputed.format_ok and len(precomputed.rubrics) > 0:
+                items[i]["proposal"] = precomputed
+                continue
+
+        try:
+            items[i]["proposal"] = rub.generate(
+                question=items[i]["question"],
+                response=items[i]["solution"],
+                cot=items[i]["cot"],
+                trajectory_history=histories[i],
+                turn_idx=items[i].get("turn_idx", None),
+                extra_info=items[i].get("extra_info", {}),
+            )
+        except Exception:
+            if not fallback_to_heuristic:
+                items[i]["proposal"] = RubricProposal(rubrics=[], format_ok=False, raw="rubricator_error")
+            else:
+                items[i]["proposal"] = HeuristicRubricator().generate(
+                    question=items[i]["question"],
+                    response=items[i]["solution"],
+                    cot=items[i]["cot"],
+                )
 
     group_to_indices: Dict[str, List[int]] = {}
     for i, x in enumerate(items):
@@ -659,7 +954,7 @@ def compute_score(
     extra_info=None,
     **kwargs,
 ):
-    """RLCER custom reward function.
+    """GEAR custom reward function.
 
     Supports both VERL batch reward-manager signature and single-item signature.
 

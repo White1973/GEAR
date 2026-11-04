@@ -30,7 +30,7 @@
 # Everything else identical.
 #
 # SUCCESS CRITERIA (read from log):
-#   - rlcer/train/rubricator_update_mode == 1.0 every step   (switch took effect)
+#   - gear/train/rubricator_update_mode == 1.0 every step   (switch took effect)
 #   - actor/ppo_kl ~ 0.0003 level                              (reasoner clean)
 #   - actor_rub/ppo_kl, actor_rub/entropy present              (rubricator updates)
 #   - actor/entropy back to healthy range
@@ -128,7 +128,7 @@ RAY_PORT=0 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=5,6 /opt/conda/envs/vagen/bin
     critic.model.fsdp_config.param_offload=True \
     critic.model.fsdp_config.optimizer_offload=True \
     reward_model.reward_manager=batch \
-    custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+    custom_reward_function.path=vagen/gear/reward_gear.py \
     custom_reward_function.name=compute_score \
     custom_reward_function.reward_kwargs.enable_dual_role_update=true \
     custom_reward_function.reward_kwargs.dual_role_strategy=shared_rho \

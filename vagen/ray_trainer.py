@@ -83,13 +83,9 @@ from vagen.utils.upload_hugging_face import HFUploadManager
 from vagen.utils.image_validation_logger import ValidationGenerationsLogger
 from vagen.utils.concat_val_multi_turn import concat_val_multi_turn
 from vagen.utils.image_token_utils import replace_image_tokens_for_logging
-from vagen.rlcer.prompt_templates import (
-    FROZENLAKE_RUBRICATOR_SYSTEM_PROMPT,
-    FROZENLAKE_RUBRICATOR_USER_PROMPT,
-    RLCER_RUBRICATOR_SYSTEM_PROMPT,
-    RLCER_RUBRICATOR_USER_PROMPT,
-)
-from vagen.rlcer.scheduler import RubricatorScheduler
+from vagen.gear.prompt_templates import get_rubricator_prompts
+from vagen.gear.scheduler import RubricatorScheduler
+from vagen.gear.turn_level import redistribute_turn_process_rewards
 import vagen.custom_advantage
 from vagen.custom_metric.metric import METRIC_REGISTRY
 from vagen.custom_filter.filter import FILTER_REGISTRY
@@ -148,8 +144,8 @@ def _flatten_chat_content(content) -> str:
     return "".join(chunks)
 
 
-def _record_rlcer_reward_diagnostics(metrics: dict, reward_extra_infos_dict: dict) -> None:
-    """Expose numeric RLCER reward diagnostics in the per-step trainer log."""
+def _record_gear_reward_diagnostics(metrics: dict, reward_extra_infos_dict: dict) -> None:
+    """Expose numeric GEAR reward diagnostics in the per-step trainer log."""
     key_map = {
         "valid_ratio": "valid_ratio",
         "rubric_accepted_rate": "rubrics_accepted_rate",
@@ -180,7 +176,7 @@ def _record_rlcer_reward_diagnostics(metrics: dict, reward_extra_infos_dict: dic
             numeric = np.asarray(values, dtype=np.float64)
             finite = numeric[np.isfinite(numeric)]
             if finite.size:
-                metrics[f"rlcer/train/{metric_name}"] = float(finite.mean())
+                metrics[f"gear/train/{metric_name}"] = float(finite.mean())
         except (TypeError, ValueError):
             continue
 
@@ -207,15 +203,15 @@ def _record_rlcer_reward_diagnostics(metrics: dict, reward_extra_infos_dict: dic
             total_count = float(np.nansum(total))
             computable_count = float(np.nansum(accepted) + np.nansum(rejected))
             if total_count > 0:
-                metrics["rlcer/train/rubric_acceptance_rate_overall_weighted"] = (
+                metrics["gear/train/rubric_acceptance_rate_overall_weighted"] = (
                     float(np.nansum(accepted)) / total_count
                 )
-                metrics["rlcer/train/correlation_unavailable_rate_weighted"] = (
+                metrics["gear/train/correlation_unavailable_rate_weighted"] = (
                     float(np.nansum(unavailable)) / total_count
                 )
             if computable_count > 0:
                 metrics[
-                    "rlcer/train/rubric_acceptance_rate_given_computable"
+                    "gear/train/rubric_acceptance_rate_given_computable"
                 ] = float(np.nansum(accepted)) / computable_count
     except (TypeError, ValueError):
         pass
@@ -248,7 +244,7 @@ def _record_rlcer_reward_diagnostics(metrics: dict, reward_extra_infos_dict: dic
                 & (count_values > 0)
             )
             if np.any(mask):
-                metrics[f"rlcer/train/{metric_name}"] = float(
+                metrics[f"gear/train/{metric_name}"] = float(
                     np.average(mean_values[mask], weights=count_values[mask])
                 )
         except (TypeError, ValueError):
@@ -619,7 +615,7 @@ class RayPPOTrainer:
         # HuggingFace Hub upload
         self._hf_upload_manager = HFUploadManager(config)
 
-        self._rlcer_rubric_gen_cache = None
+        self._gear_rubric_gen_cache = None
         self._rubric_replay_batches = []
 
         anchor_cfg = (
@@ -990,7 +986,7 @@ class RayPPOTrainer:
         reward_tensor[row_idx, col_idx] = scores
         return reward_tensor
 
-    def _build_rlcer_policy_rubricator_prompts(self, batch: DataProto) -> tuple[list[list[int]], list[Optional[list]]]:
+    def _build_gear_policy_rubricator_prompts(self, batch: DataProto) -> tuple[list[list[int]], list[Optional[list]]]:
         """Build rubricator model inputs from current trajectories.
 
         Each input includes:
@@ -1020,22 +1016,12 @@ class RayPPOTrainer:
                 current_image = img_item
 
             data_source = data_source_batch[i] if i < len(data_source_batch) else None
-            is_frozenlake = "frozenlake" in str(data_source).lower()
-            rubricator_system_prompt = (
-                FROZENLAKE_RUBRICATOR_SYSTEM_PROMPT
-                if is_frozenlake
-                else RLCER_RUBRICATOR_SYSTEM_PROMPT
-            )
-            rubricator_user_prompt = (
-                FROZENLAKE_RUBRICATOR_USER_PROMPT
-                if is_frozenlake
-                else RLCER_RUBRICATOR_USER_PROMPT
-            )
-            task_instruction = (
-                "\nAnalyze the current FrozenLake board state and generate evaluation rubrics."
-                if is_frozenlake
-                else "\nAnalyze the current Sokoban board state and generate evaluation rubrics."
-            )
+            (
+                rubricator_system_prompt,
+                rubricator_user_prompt,
+                task_instruction,
+            ) = get_rubricator_prompts(data_source)
+            task_instruction = "\n" + task_instruction
 
             user_tail = (
                 f"\n\n[Turn ID]\nturn_{int(self.global_steps):06d}\n"
@@ -1091,7 +1077,7 @@ class RayPPOTrainer:
         
         return prompt_id_list, image_payloads
 
-    def _generate_rlcer_policy_rubrics_with_current_actor(self, batch: DataProto) -> list[str] | None:
+    def _generate_gear_policy_rubrics_with_current_actor(self, batch: DataProto) -> list[str] | None:
         """Generate rubric proposals using the CURRENT actor policy.
 
         This makes rubricator and solver share the same synchronized policy weights.
@@ -1100,7 +1086,7 @@ class RayPPOTrainer:
         rubricator_cfg = reward_cfg.get("rubricator", {})
         rubric_mode = str(rubricator_cfg.get("mode", "")).lower()
 
-        self._rlcer_rubric_gen_cache = None
+        self._gear_rubric_gen_cache = None
 
         if rubric_mode != "policy":
             return None
@@ -1109,7 +1095,7 @@ class RayPPOTrainer:
         if not use_actor_policy:
             return None
         
-        prompt_id_list, image_payloads = self._build_rlcer_policy_rubricator_prompts(batch)
+        prompt_id_list, image_payloads = self._build_gear_policy_rubricator_prompts(batch)
         if len(prompt_id_list) == 0:
             return []
         
@@ -1136,7 +1122,7 @@ class RayPPOTrainer:
                 reqs = []
                 for i, ids in enumerate(prompt_id_list):
                     server = server_handles[i % len(server_handles)]
-                    req_id = f"rlcer-rubric-{self.global_steps}-{i}-{uuid.uuid4().hex[:8]}"
+                    req_id = f"gear-rubric-{self.global_steps}-{i}-{uuid.uuid4().hex[:8]}"
                     reqs.append(
                         server.generate.remote(
                             prompt_ids=ids,
@@ -1154,7 +1140,7 @@ class RayPPOTrainer:
                     rubric_response_ids.append(toks)
                     rubric_raws.append(self.tokenizer.decode(toks, skip_special_tokens=True))
 
-                self._rlcer_rubric_gen_cache = {
+                self._gear_rubric_gen_cache = {
                     "source": "async",
                     "prompt_id_list": prompt_id_list,
                     "response_ids_list": rubric_response_ids,
@@ -1213,7 +1199,7 @@ class RayPPOTrainer:
             l = int(gen_lens[i].item())
             rubric_raws.append(self.tokenizer.decode(generated[i][:l], skip_special_tokens=True))
 
-        self._rlcer_rubric_gen_cache = {
+        self._gear_rubric_gen_cache = {
             "source": "sync",
             "prompt_id_list": prompt_id_list,
             "input_ids": input_ids,
@@ -1227,7 +1213,7 @@ class RayPPOTrainer:
 
         return rubric_raws
 
-    def _build_rlcer_joint_training_batch(
+    def _build_gear_joint_training_batch(
         self,
         reasoner_batch: DataProto,
         reasoner_reward_tensor: torch.Tensor,
@@ -1243,37 +1229,37 @@ class RayPPOTrainer:
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         enable_dual_role_update = reward_cfg.get("enable_dual_role_update", False)
 
-        reasoner_batch.non_tensor_batch["rlcer_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
+        reasoner_batch.non_tensor_batch["gear_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
         if not enable_dual_role_update:
             return reasoner_batch
 
         update_interval = max(1, int(reward_cfg.get("rubricator_update_interval", 1)))
         if self.global_steps % update_interval != 0:
-            metrics["rlcer/train/dual_role_skipped_update_interval"] = 1.0
-            metrics["rlcer/train/rubricator_update_interval"] = float(update_interval)
+            metrics["gear/train/dual_role_skipped_update_interval"] = 1.0
+            metrics["gear/train/rubricator_update_interval"] = float(update_interval)
             return reasoner_batch
 
         rubricator_rewards = reward_extra_infos_dict.get("rubricator_reward", None)
         if rubricator_rewards is None:
-            metrics["rlcer/train/dual_role_skipped_no_rubricator_reward"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_rubricator_reward"] = 1.0
             return reasoner_batch
         if len(rubricator_rewards) != len(reasoner_batch):
-            metrics["rlcer/train/dual_role_skipped_len_mismatch"] = 1.0
+            metrics["gear/train/dual_role_skipped_len_mismatch"] = 1.0
             return reasoner_batch
 
         # Signal gate: skip dual-role when rubricator has no valid signal
         valid_ratios = reward_extra_infos_dict.get("valid_ratio", None)
         if valid_ratios is not None:
             mean_valid_ratio = float(np.mean(valid_ratios))
-            metrics["rlcer/train/mean_valid_ratio"] = mean_valid_ratio
+            metrics["gear/train/mean_valid_ratio"] = mean_valid_ratio
             min_valid_ratio = float(reward_cfg.get("dual_role_min_valid_ratio", 0.01))
             if mean_valid_ratio < min_valid_ratio:
-                metrics["rlcer/train/dual_role_skipped_no_signal"] = 1.0
+                metrics["gear/train/dual_role_skipped_no_signal"] = 1.0
                 return reasoner_batch
 
         rubricator_scores = torch.tensor(rubricator_rewards, dtype=torch.float32, device=reasoner_reward_tensor.device)
         rubricator_batch = deepcopy(reasoner_batch)
-        rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
+        rubricator_batch.non_tensor_batch["gear_role"] = np.array(["rubricator"] * len(rubricator_batch), dtype=object)
 
         rubricator_reward_tensor = self._build_terminal_reward_tensor_from_scores(rubricator_batch, rubricator_scores)
         rubricator_batch.batch["token_level_scores"] = rubricator_reward_tensor
@@ -1300,11 +1286,11 @@ class RayPPOTrainer:
         shuffle_indices = np.random.permutation(len(joint_batch))
         joint_batch = joint_batch[shuffle_indices]
 
-        metrics["rlcer/train/dual_role_enabled"] = 1.0
-        metrics["rlcer/train/rubricator_update_interval"] = float(update_interval)
-        metrics["rlcer/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
+        metrics["gear/train/dual_role_enabled"] = 1.0
+        metrics["gear/train/rubricator_update_interval"] = float(update_interval)
+        metrics["gear/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
         return joint_batch
 
     def _build_rubricator_trajectory_batch(
@@ -1317,7 +1303,7 @@ class RayPPOTrainer:
 
         Constructs a full trajectory batch (prompts + responses) for the rubricator
         role using the cached prompt/response token IDs from
-        _generate_rlcer_policy_rubrics_with_current_actor.  The rubricator tokens
+        _generate_gear_policy_rubrics_with_current_actor.  The rubricator tokens
         are the ACTUAL generation tokens, so PPO gradients will flow through them.
 
         The returned batch has token_level_scores/rewards set but **does not** have
@@ -1326,9 +1312,9 @@ class RayPPOTrainer:
 
         Returns None if cached generation data is unavailable.
         """
-        cache = getattr(self, "_rlcer_rubric_gen_cache", None)
+        cache = getattr(self, "_gear_rubric_gen_cache", None)
         if cache is None:
-            metrics["rlcer/train/rubricator_traj_no_cache"] = 1.0
+            metrics["gear/train/rubricator_traj_no_cache"] = 1.0
             return None
 
         n_reward = len(rubricator_rewards)
@@ -1366,7 +1352,7 @@ class RayPPOTrainer:
 
         B_rub = prompt_ids.shape[0]
         if B_rub != n_reward:
-            metrics["rlcer/train/rubricator_traj_len_mismatch"] = 1.0
+            metrics["gear/train/rubricator_traj_len_mismatch"] = 1.0
             return None
 
         input_ids = torch.cat([prompt_ids, responses], dim=1)
@@ -1406,7 +1392,7 @@ class RayPPOTrainer:
         rubricator_batch = DataProto.from_single_dict(rub_batch_dict)
         rubricator_batch.meta_info = dict(reasoner_batch.meta_info)
 
-        rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(
+        rubricator_batch.non_tensor_batch["gear_role"] = np.array(
             ["rubricator"] * B_rub, dtype=object
         )
 
@@ -1447,10 +1433,10 @@ class RayPPOTrainer:
             rub_P = prompt_ids.shape[1]
             rubricator_batch.batch["responses"] = rubricator_batch.batch["input_ids"][:, rub_P:]
         elif rub_seq_len > reasoner_seq_len:
-            metrics["rlcer/train/rubricator_traj_truncated"] = 1.0
+            metrics["gear/train/rubricator_traj_truncated"] = 1.0
             max_resp = reasoner_seq_len - prompt_ids.shape[1]
             if max_resp <= 0:
-                metrics["rlcer/train/rubricator_traj_prompt_too_long"] = 1.0
+                metrics["gear/train/rubricator_traj_prompt_too_long"] = 1.0
                 return None
             for key in list(rubricator_batch.batch.keys()):
                 tensor = rubricator_batch.batch[key]
@@ -1477,26 +1463,26 @@ class RayPPOTrainer:
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         enable_dual_role_update = reward_cfg.get("enable_dual_role_update", False)
 
-        reasoner_batch.non_tensor_batch["rlcer_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
+        reasoner_batch.non_tensor_batch["gear_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
         if not enable_dual_role_update:
             return reasoner_batch
 
         rubricator_rewards = reward_extra_infos_dict.get("rubricator_reward", None)
         if rubricator_rewards is None:
-            metrics["rlcer/train/dual_role_skipped_no_rubricator_reward"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_rubricator_reward"] = 1.0
             return reasoner_batch
         if len(rubricator_rewards) != len(reasoner_batch):
-            metrics["rlcer/train/dual_role_skipped_len_mismatch"] = 1.0
+            metrics["gear/train/dual_role_skipped_len_mismatch"] = 1.0
             return reasoner_batch
 
         # Signal gate: skip dual-role when rubricator has no valid signal
         valid_ratios = reward_extra_infos_dict.get("valid_ratio", None)
         if valid_ratios is not None:
             mean_valid_ratio = float(np.mean(valid_ratios))
-            metrics["rlcer/train/mean_valid_ratio"] = mean_valid_ratio
+            metrics["gear/train/mean_valid_ratio"] = mean_valid_ratio
             min_valid_ratio = float(reward_cfg.get("dual_role_min_valid_ratio", 0.01))
             if mean_valid_ratio < min_valid_ratio:
-                metrics["rlcer/train/dual_role_skipped_no_signal"] = 1.0
+                metrics["gear/train/dual_role_skipped_no_signal"] = 1.0
                 return reasoner_batch
 
         rubricator_batch = self._build_rubricator_trajectory_batch(
@@ -1506,15 +1492,15 @@ class RayPPOTrainer:
         )
 
         if rubricator_batch is not None:
-            metrics["rlcer/train/dual_role_rubricator_trajectory"] = 1.0
+            metrics["gear/train/dual_role_rubricator_trajectory"] = 1.0
         else:
-            metrics["rlcer/train/dual_role_fallback_deepcopy"] = 1.0
+            metrics["gear/train/dual_role_fallback_deepcopy"] = 1.0
             rubricator_scores = torch.tensor(
                 rubricator_rewards, dtype=torch.float32,
                 device=reasoner_batch.batch["responses"].device,
             )
             rubricator_batch = deepcopy(reasoner_batch)
-            rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(
+            rubricator_batch.non_tensor_batch["gear_role"] = np.array(
                 ["rubricator"] * len(rubricator_batch), dtype=object
             )
             rubricator_reward_tensor = self._build_terminal_reward_tensor_from_scores(
@@ -1531,7 +1517,7 @@ class RayPPOTrainer:
             indices = np.random.choice(len(rubricator_batch), rub_subsample, replace=False)
             indices.sort()
             rubricator_batch = rubricator_batch[indices]
-            metrics["rlcer/train/rubricator_subsampled_to"] = float(rub_subsample)
+            metrics["gear/train/rubricator_subsampled_to"] = float(rub_subsample)
 
         # --- Ensure all tensor keys are aligned ---
         reasoner_keys = set(reasoner_batch.batch.keys())
@@ -1591,19 +1577,19 @@ class RayPPOTrainer:
         shuffle_indices = np.random.permutation(len(joint_batch))
         joint_batch = joint_batch[shuffle_indices]
 
-        metrics["rlcer/train/dual_role_enabled"] = 1.0
-        metrics["rlcer/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
-        metrics["rlcer/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
+        metrics["gear/train/dual_role_enabled"] = 1.0
+        metrics["gear/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_max"] = float(np.max(rubricator_rewards))
+        metrics["gear/train/rubricator_reward_min"] = float(np.min(rubricator_rewards))
         return joint_batch
 
-    def _compute_rlcer_role_specific_advantages(self, batch: DataProto, metrics: dict) -> DataProto:
+    def _compute_gear_role_specific_advantages(self, batch: DataProto, metrics: dict) -> DataProto:
         """Compute advantages independently for each role in the joint batch.
 
-        Splits by rlcer_role, computes GAE per role, scales rubricator advantages
+        Splits by gear_role, computes GAE per role, scales rubricator advantages
         by rubricator_loss_weight, and restores original sample order.
         """
-        role_arr = batch.non_tensor_batch.get("rlcer_role", None)
+        role_arr = batch.non_tensor_batch.get("gear_role", None)
         if role_arr is None:
             norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
             batch = compute_advantage(
@@ -1661,14 +1647,14 @@ class RayPPOTrainer:
         rub_mask = rubricator_sub.batch["response_mask"]
         reward_per_sample = (rub_rewards * rub_mask).sum(dim=-1)
         reward_var = reward_per_sample.var().item() if len(reward_per_sample) > 1 else 0.0
-        metrics["rlcer/train/rubricator_reward_var"] = reward_var
+        metrics["gear/train/rubricator_reward_var"] = reward_var
 
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         rub_var_threshold = float(reward_cfg.get("rubricator_var_threshold", 0.01))
         if reward_var < rub_var_threshold:
             rubricator_sub.batch["advantages"] = torch.zeros_like(rub_rewards)
             rubricator_sub.batch["returns"] = rub_rewards.clone()
-            metrics["rlcer/train/rubricator_adv_zeroed"] = 1.0
+            metrics["gear/train/rubricator_adv_zeroed"] = 1.0
         else:
             # REINFORCE: advantage = reward - mean_reward, broadcast to token level
             mean_reward = reward_per_sample.mean()
@@ -1680,7 +1666,7 @@ class RayPPOTrainer:
                 token_adv[idx, last_pos] = reward_per_sample[idx] - mean_reward
             rubricator_sub.batch["advantages"] = masked_whiten(token_adv, rub_mask)
             rubricator_sub.batch["returns"] = rub_rewards.clone()
-            metrics["rlcer/train/rubricator_adv_zeroed"] = 0.0
+            metrics["gear/train/rubricator_adv_zeroed"] = 0.0
 
         if self.config.algorithm.adv_estimator in ["no_concat_gae_last", "no_concat_gae_first"]:
             reasoner_sub.batch["value_mask"] = compute_value_mask(reasoner_sub)
@@ -1692,7 +1678,7 @@ class RayPPOTrainer:
             rubricator_sub.batch["advantages"] = (
                 rubricator_sub.batch["advantages"] * rub_loss_weight
             )
-        metrics["rlcer/train/rubricator_loss_weight"] = rub_loss_weight
+        metrics["gear/train/rubricator_loss_weight"] = rub_loss_weight
 
         # --- Merge back in original order ---
         rea_keys = set(reasoner_sub.batch.keys())
@@ -1730,13 +1716,13 @@ class RayPPOTrainer:
             if len(arr) == len(joint_batch):
                 joint_batch.non_tensor_batch[key] = arr[restore_perm]
 
-        metrics["rlcer/train/advantage_computed_per_role"] = 1.0
+        metrics["gear/train/advantage_computed_per_role"] = 1.0
         return joint_batch
 
     def _build_rubric_recovery_batch(self, metrics: dict, timing_raw: dict):
         """Create an on-policy imitation batch from a healthy rubric replay."""
         if not self._rubric_replay_batches:
-            metrics["rlcer/train/recovery_skipped_empty_replay"] = 1.0
+            metrics["gear/train/recovery_skipped_empty_replay"] = 1.0
             return None
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         replay_cfg = reward_cfg.get("rubric_replay", {})
@@ -1746,7 +1732,7 @@ class RayPPOTrainer:
             indices = np.random.choice(len(recovery_batch), sample_size, replace=False)
             indices.sort()
             recovery_batch = recovery_batch[indices]
-        recovery_batch.non_tensor_batch["rlcer_role"] = np.array(
+        recovery_batch.non_tensor_batch["gear_role"] = np.array(
             ["rubricator"] * len(recovery_batch), dtype=object
         )
         with marked_timer("rubric_recovery_log_prob", timing_raw, color="purple"):
@@ -1756,8 +1742,8 @@ class RayPPOTrainer:
         advantage = float(replay_cfg.get("recovery_advantage", 1.0))
         recovery_batch.batch["advantages"] = mask * advantage
         recovery_batch.batch["returns"] = torch.zeros_like(mask)
-        metrics["rlcer/train/recovery_replay_active"] = 1.0
-        metrics["rlcer/train/recovery_replay_batch_size"] = float(len(recovery_batch))
+        metrics["gear/train/recovery_replay_active"] = 1.0
+        metrics["gear/train/recovery_replay_batch_size"] = float(len(recovery_batch))
         return recovery_batch
 
     def _align_and_concat_role_batches(self, reasoner_batch: DataProto, rubricator_batch: DataProto) -> DataProto:
@@ -1837,37 +1823,37 @@ class RayPPOTrainer:
         reward_cfg = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
         enable_dual_role_update = reward_cfg.get("enable_dual_role_update", False)
 
-        reasoner_batch.non_tensor_batch["rlcer_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
+        reasoner_batch.non_tensor_batch["gear_role"] = np.array(["reasoner"] * len(reasoner_batch), dtype=object)
         if not enable_dual_role_update:
             if getattr(self.rubricator_scheduler, "_health_state", "normal") == "recovery":
                 recovery_batch = self._build_rubric_recovery_batch(metrics, timing_raw)
                 if recovery_batch is not None:
-                    metrics["rlcer/train/rubricator_update_mode"] = 2.0
+                    metrics["gear/train/rubricator_update_mode"] = 2.0
                     return self._align_and_concat_role_batches(reasoner_batch, recovery_batch)
             return reasoner_batch
 
         update_interval = max(1, int(reward_cfg.get("rubricator_update_interval", 1)))
         if self.global_steps % update_interval != 0:
-            metrics["rlcer/train/dual_role_skipped_update_interval"] = 1.0
-            metrics["rlcer/train/rubricator_update_interval"] = float(update_interval)
+            metrics["gear/train/dual_role_skipped_update_interval"] = 1.0
+            metrics["gear/train/rubricator_update_interval"] = float(update_interval)
             return reasoner_batch
 
         rubricator_rewards = reward_extra_infos_dict.get("rubricator_reward", None)
         if rubricator_rewards is None:
-            metrics["rlcer/train/dual_role_skipped_no_rubricator_reward"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_rubricator_reward"] = 1.0
             return reasoner_batch
         if len(rubricator_rewards) != len(reasoner_batch):
-            metrics["rlcer/train/dual_role_skipped_len_mismatch"] = 1.0
+            metrics["gear/train/dual_role_skipped_len_mismatch"] = 1.0
             return reasoner_batch
 
         # Signal gate: skip when rubricator has no valid signal
         valid_ratios = reward_extra_infos_dict.get("valid_ratio", None)
         if valid_ratios is not None:
             mean_valid_ratio = float(np.mean(valid_ratios))
-            metrics["rlcer/train/mean_valid_ratio"] = mean_valid_ratio
+            metrics["gear/train/mean_valid_ratio"] = mean_valid_ratio
             min_valid_ratio = float(reward_cfg.get("dual_role_min_valid_ratio", 0.01))
             if mean_valid_ratio < min_valid_ratio:
-                metrics["rlcer/train/dual_role_skipped_no_signal"] = 1.0
+                metrics["gear/train/dual_role_skipped_no_signal"] = 1.0
                 return reasoner_batch
 
         # Build rubricator batch from cached generation tokens
@@ -1878,7 +1864,7 @@ class RayPPOTrainer:
         )
 
         if rubricator_batch is None:
-            metrics["rlcer/train/dual_role_skipped_no_cache"] = 1.0
+            metrics["gear/train/dual_role_skipped_no_cache"] = 1.0
             return reasoner_batch
 
         # Subsample rubricator to limit compute
@@ -1889,9 +1875,9 @@ class RayPPOTrainer:
             indices = np.random.choice(len(rubricator_batch), rub_subsample, replace=False)
             indices.sort()
             rubricator_batch = rubricator_batch[indices]
-            metrics["rlcer/train/rubricator_subsampled_to"] = float(rub_subsample)
+            metrics["gear/train/rubricator_subsampled_to"] = float(rub_subsample)
 
-        rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(
+        rubricator_batch.non_tensor_batch["gear_role"] = np.array(
             ["rubricator"] * len(rubricator_batch), dtype=object
         )
 
@@ -1905,13 +1891,13 @@ class RayPPOTrainer:
         rub_mask = rubricator_batch.batch["response_mask"]
         reward_per_sample = (rub_rewards * rub_mask).sum(dim=-1)
         reward_var = reward_per_sample.var().item() if len(reward_per_sample) > 1 else 0.0
-        metrics["rlcer/train/rubricator_reward_var"] = reward_var
+        metrics["gear/train/rubricator_reward_var"] = reward_var
 
         rub_var_threshold = float(reward_cfg.get("rubricator_var_threshold", 0.01))
         if reward_var < rub_var_threshold:
             rubricator_batch.batch["advantages"] = torch.zeros_like(rub_rewards)
             rubricator_batch.batch["returns"] = rub_rewards.clone()
-            metrics["rlcer/train/rubricator_adv_zeroed"] = 1.0
+            metrics["gear/train/rubricator_adv_zeroed"] = 1.0
         else:
             mean_reward = reward_per_sample.mean()
             token_adv = torch.zeros_like(rub_rewards)
@@ -1921,7 +1907,7 @@ class RayPPOTrainer:
                 token_adv[idx, last_pos] = reward_per_sample[idx] - mean_reward
             rubricator_batch.batch["advantages"] = masked_whiten(token_adv, rub_mask)
             rubricator_batch.batch["returns"] = rub_rewards.clone()
-            metrics["rlcer/train/rubricator_adv_zeroed"] = 0.0
+            metrics["gear/train/rubricator_adv_zeroed"] = 0.0
 
         # Scale rubricator advantages
         rub_loss_weight = float(reward_cfg.get("rubricator_loss_weight", 0.5))
@@ -1929,10 +1915,10 @@ class RayPPOTrainer:
             rubricator_batch.batch["advantages"] = (
                 rubricator_batch.batch["advantages"] * rub_loss_weight
             )
-        metrics["rlcer/train/rubricator_loss_weight"] = rub_loss_weight
-        metrics["rlcer/train/dual_role_enabled"] = 1.0
-        metrics["rlcer/train/rubricator_update_interval"] = float(update_interval)
-        metrics["rlcer/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
+        metrics["gear/train/rubricator_loss_weight"] = rub_loss_weight
+        metrics["gear/train/dual_role_enabled"] = 1.0
+        metrics["gear/train/rubricator_update_interval"] = float(update_interval)
+        metrics["gear/train/rubricator_reward_mean"] = float(np.mean(rubricator_rewards))
 
         replay_cfg = reward_cfg.get("rubric_replay", {})
         if bool(replay_cfg.get("enabled", False)):
@@ -1950,7 +1936,7 @@ class RayPPOTrainer:
                 max_batches = max(1, int(replay_cfg.get("max_batches", 4)))
                 self._rubric_replay_batches.append(deepcopy(rubricator_batch).to("cpu"))
                 self._rubric_replay_batches = self._rubric_replay_batches[-max_batches:]
-                metrics["rlcer/train/rubric_replay_size"] = float(len(self._rubric_replay_batches))
+                metrics["gear/train/rubric_replay_size"] = float(len(self._rubric_replay_batches))
 
         # ============================================================
         # PLAN B (isolate_rubricator_update): run rubricator as a FULLY
@@ -1969,16 +1955,16 @@ class RayPPOTrainer:
         # ============================================================
         rubricator_update_mode = str(reward_cfg.get("rubricator_update_mode", "joint")).lower()
         if rubricator_update_mode in ("isolate", "isolated", "plan_b"):
-            metrics["rlcer/train/rubricator_update_mode"] = 1.0  # isolated
-            metrics["rlcer/train/rubricator_subsampled_to"] = float(len(rubricator_batch))
-            # Mark rubricator batch as pure-rubricator (no rlcer_role mixing so
+            metrics["gear/train/rubricator_update_mode"] = 1.0  # isolated
+            metrics["gear/train/rubricator_subsampled_to"] = float(len(rubricator_batch))
+            # Mark rubricator batch as pure-rubricator (no gear_role mixing so
             # dp_actor takes the single-role vanilla path). reasoner_batch keeps
-            # its all-"reasoner" rlcer_role for per-role metric attribution.
-            rubricator_batch.non_tensor_batch["rlcer_role"] = np.array(
+            # its all-"reasoner" gear_role for per-role metric attribution.
+            rubricator_batch.non_tensor_batch["gear_role"] = np.array(
                 ["rubricator"] * len(rubricator_batch), dtype=object
             )
             return reasoner_batch, rubricator_batch
-        metrics["rlcer/train/rubricator_update_mode"] = 0.0  # joint (legacy)
+        metrics["gear/train/rubricator_update_mode"] = 0.0  # joint (legacy)
 
         return self._align_and_concat_role_batches(reasoner_batch, rubricator_batch)
 
@@ -2102,16 +2088,16 @@ class RayPPOTrainer:
             else:
                 sample_images.extend([None] * len(outputs))
 
-            # RLCER: generate rubric proposals for validation batch
+            # GEAR: generate rubric proposals for validation batch
             val_reward_kwargs = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
             val_rubric_mode = str(val_reward_kwargs.get("rubricator", {}).get("mode", "")).lower()
             if val_rubric_mode == "policy":
                 try:
-                    val_rubric_raws = self._generate_rlcer_policy_rubrics_with_current_actor(test_batch)
+                    val_rubric_raws = self._generate_gear_policy_rubrics_with_current_actor(test_batch)
                     if val_rubric_raws is not None and len(val_rubric_raws) == len(test_batch):
-                        test_batch.non_tensor_batch["rlcer_policy_rubric_raw"] = np.array(val_rubric_raws, dtype=object)
+                        test_batch.non_tensor_batch["gear_policy_rubric_raw"] = np.array(val_rubric_raws, dtype=object)
                 except Exception as e:
-                    print(f"[RLCER] validation rubricator generation failed: {e}")
+                    print(f"[GEAR] validation rubricator generation failed: {e}")
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -2377,7 +2363,7 @@ class RayPPOTrainer:
         )
         if callable(tracker_state_getter):
             tracker_local_path = os.path.join(
-                local_global_step_folder, "rlcer_tracker.pt"
+                local_global_step_folder, "gear_tracker.pt"
             )
             torch.save(tracker_state_getter(), tracker_local_path)
 
@@ -2449,7 +2435,7 @@ class RayPPOTrainer:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
         tracker_local_path = os.path.join(
-            global_step_folder, "rlcer_tracker.pt"
+            global_step_folder, "gear_tracker.pt"
         )
         compute_score_fn = getattr(self.reward_fn, "compute_score", None)
         tracker_state_loader = getattr(
@@ -2459,7 +2445,7 @@ class RayPPOTrainer:
             tracker_state_loader(
                 torch.load(tracker_local_path, weights_only=False)
             )
-            print(f"Loaded RLCER tracker state from {tracker_local_path}")
+            print(f"Loaded GEAR tracker state from {tracker_local_path}")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -2679,20 +2665,20 @@ class RayPPOTrainer:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # RLCER policy-sync rubricator: generate rubric proposals with current actor policy.
+                        # GEAR policy-sync rubricator: generate rubric proposals with current actor policy.
                         # Skip when pure_outcome mode is enabled (no rubric needed).
                         reward_kwargs = self.config.get("custom_reward_function", {}).get("reward_kwargs", {})
-                        batch.non_tensor_batch["rlcer_global_step"] = np.full(
+                        batch.non_tensor_batch["gear_global_step"] = np.full(
                             len(batch), self.global_steps, dtype=np.int64
                         )
                         if not reward_kwargs.get("pure_outcome", False):
                             try:
-                                rubric_raws = self._generate_rlcer_policy_rubrics_with_current_actor(batch)
+                                rubric_raws = self._generate_gear_policy_rubrics_with_current_actor(batch)
                                 if rubric_raws is not None and len(rubric_raws) == len(batch):
-                                    batch.non_tensor_batch["rlcer_policy_rubric_raw"] = np.array(rubric_raws, dtype=object)
+                                    batch.non_tensor_batch["gear_policy_rubric_raw"] = np.array(rubric_raws, dtype=object)
                             except Exception as e:
-                                metrics["rlcer/train/policy_rubricator_generation_failed"] = 1.0
-                                print(f"[RLCER] policy rubricator generation failed: {e}")
+                                metrics["gear/train/policy_rubricator_generation_failed"] = 1.0
+                                print(f"[GEAR] policy rubricator generation failed: {e}")
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(
                                 data=batch, config=self.config, tokenizer=self.tokenizer
@@ -2723,8 +2709,13 @@ class RayPPOTrainer:
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            reward_tensor = redistribute_turn_process_rewards(
+                                reward_tensor,
+                                reward_extra_infos_dict,
+                                batch.batch["response_mask"],
+                            )
                             batch.batch["token_level_scores"] = reward_tensor
-                            _record_rlcer_reward_diagnostics(metrics, reward_extra_infos_dict)
+                            _record_gear_reward_diagnostics(metrics, reward_extra_infos_dict)
 
                             if reward_extra_infos_dict:
                                 batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
@@ -2881,8 +2872,13 @@ class RayPPOTrainer:
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            reward_tensor = redistribute_turn_process_rewards(
+                                reward_tensor,
+                                reward_extra_infos_dict,
+                                batch.batch["response_mask"],
+                            )
                             batch.batch["token_level_scores"] = reward_tensor
-                            _record_rlcer_reward_diagnostics(metrics, reward_extra_infos_dict)
+                            _record_gear_reward_diagnostics(metrics, reward_extra_infos_dict)
 
                             if reward_extra_infos_dict:
                                 batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
@@ -2931,7 +2927,7 @@ class RayPPOTrainer:
                             )
 
                             reasoner_critic_batch = batch
-                            batch = self._build_rlcer_joint_training_batch(
+                            batch = self._build_gear_joint_training_batch(
                                 reasoner_batch=batch,
                                 reasoner_reward_tensor=reward_tensor,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
@@ -2941,11 +2937,11 @@ class RayPPOTrainer:
                     if self.config.algorithm.adv_estimator in ["no_concat_gae_last", "no_concat_gae_first"]:
                         batch.batch["value_mask"] = compute_value_mask(batch)
 
-                    if "rlcer_role" in batch.non_tensor_batch:
+                    if "gear_role" in batch.non_tensor_batch:
                         rub_w = float(reward_kwargs.get("rubricator_loss_weight", 0.0))
                         batch.meta_info["rubricator_loss_weight"] = rub_w
                         batch.meta_info["batch_has_dual_role"] = any(
-                            r == "rubricator" for r in batch.non_tensor_batch["rlcer_role"]
+                            r == "rubricator" for r in batch.non_tensor_batch["gear_role"]
                         )
                         # Optional per-role KL coef (validation-1 extension). Forwarded only when
                         # explicitly set, so default dual-role behaviour is unchanged otherwise.
@@ -2975,8 +2971,8 @@ class RayPPOTrainer:
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_batch = reasoner_critic_batch if reasoner_critic_batch is not None else batch
-                            if reasoner_critic_batch is None and "rlcer_role" in batch.non_tensor_batch:
-                                rea_mask = np.array([r == "reasoner" for r in batch.non_tensor_batch["rlcer_role"]])
+                            if reasoner_critic_batch is None and "gear_role" in batch.non_tensor_batch:
+                                rea_mask = np.array([r == "reasoner" for r in batch.non_tensor_batch["gear_role"]])
                                 if not rea_mask.all():
                                     critic_batch = batch[np.where(rea_mask)[0]]
                             critic_output = self.critic_wg.update_critic(critic_batch)
@@ -2997,12 +2993,12 @@ class RayPPOTrainer:
                         rubricator_after_reasoner_log_probs = None
                         rub_batch = getattr(self, "_isolated_rubricator_batch", None)
                         protected_joint_rows = bool(
-                            "rlcer_role" in batch.non_tensor_batch
-                            and any(r == "rubricator" for r in batch.non_tensor_batch["rlcer_role"])
+                            "gear_role" in batch.non_tensor_batch
+                            and any(r == "rubricator" for r in batch.non_tensor_batch["gear_role"])
                         )
                         if anchor_probe_step:
                             if protected_joint_rows:
-                                role_arr = np.asarray(batch.non_tensor_batch["rlcer_role"])
+                                role_arr = np.asarray(batch.non_tensor_batch["gear_role"])
                                 rea_idx = np.where(role_arr == "reasoner")[0][: self._anchor_kl_samples]
                                 rub_idx = np.where(role_arr == "rubricator")[0][: self._anchor_kl_samples]
                                 reasoner_probe = batch[rea_idx]
@@ -3036,12 +3032,12 @@ class RayPPOTrainer:
                             with marked_timer("anchor_kl_after_protected_update", timing_raw, color="olive"):
                                 rea_after = self.actor_rollout_wg.compute_log_prob(reasoner_probe)
                                 rub_after = self.actor_rollout_wg.compute_log_prob(rubricator_probe)
-                                metrics["rlcer/anchor_kl/reasoner_after_protected_update"] = _sampled_anchor_kl(
+                                metrics["gear/anchor_kl/reasoner_after_protected_update"] = _sampled_anchor_kl(
                                     reasoner_pre_log_probs,
                                     rea_after.batch["old_log_probs"],
                                     reasoner_probe.batch["response_mask"],
                                 )
-                                metrics["rlcer/anchor_kl/rubricator_after_protected_update"] = _sampled_anchor_kl(
+                                metrics["gear/anchor_kl/rubricator_after_protected_update"] = _sampled_anchor_kl(
                                     rubricator_pre_log_probs,
                                     rub_after.batch["old_log_probs"],
                                     rubricator_probe.batch["response_mask"],
@@ -3051,7 +3047,7 @@ class RayPPOTrainer:
                             with marked_timer("anchor_kl_after_reasoner", timing_raw, color="olive"):
                                 rea_after = self.actor_rollout_wg.compute_log_prob(reasoner_probe)
                                 reasoner_after_reasoner_log_probs = rea_after.batch["old_log_probs"]
-                                metrics["rlcer/anchor_kl/reasoner_after_reasoner"] = _sampled_anchor_kl(
+                                metrics["gear/anchor_kl/reasoner_after_reasoner"] = _sampled_anchor_kl(
                                     reasoner_pre_log_probs,
                                     reasoner_after_reasoner_log_probs,
                                     reasoner_probe.batch["response_mask"],
@@ -3059,7 +3055,7 @@ class RayPPOTrainer:
                                 if rubricator_probe is not None:
                                     rub_after_rea = self.actor_rollout_wg.compute_log_prob(rubricator_probe)
                                     rubricator_after_reasoner_log_probs = rub_after_rea.batch["old_log_probs"]
-                                    metrics["rlcer/anchor_kl/rubricator_after_reasoner"] = _sampled_anchor_kl(
+                                    metrics["gear/anchor_kl/rubricator_after_reasoner"] = _sampled_anchor_kl(
                                         rubricator_pre_log_probs,
                                         rubricator_after_reasoner_log_probs,
                                         rubricator_probe.batch["response_mask"],
@@ -3117,14 +3113,14 @@ class RayPPOTrainer:
                             if anchor_probe_step and reasoner_probe is not None:
                                 with marked_timer("anchor_kl_after_rubricator", timing_raw, color="olive"):
                                     rea_after_rub = self.actor_rollout_wg.compute_log_prob(reasoner_probe)
-                                    metrics["rlcer/anchor_kl/reasoner_after_rubricator"] = _sampled_anchor_kl(
+                                    metrics["gear/anchor_kl/reasoner_after_rubricator"] = _sampled_anchor_kl(
                                         reasoner_after_reasoner_log_probs,
                                         rea_after_rub.batch["old_log_probs"],
                                         reasoner_probe.batch["response_mask"],
                                     )
                                     if rubricator_probe is not None:
                                         rub_after_rub = self.actor_rollout_wg.compute_log_prob(rubricator_probe)
-                                        metrics["rlcer/anchor_kl/rubricator_after_rubricator"] = _sampled_anchor_kl(
+                                        metrics["gear/anchor_kl/rubricator_after_rubricator"] = _sampled_anchor_kl(
                                             rubricator_after_reasoner_log_probs,
                                             rub_after_rub.batch["old_log_probs"],
                                             rubricator_probe.batch["response_mask"],

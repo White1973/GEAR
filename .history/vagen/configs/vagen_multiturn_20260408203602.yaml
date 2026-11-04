@@ -78,16 +78,16 @@ huggingface_hub:
   upload_contents: ['hf_model']            
 
 # ============================================================================
-# RLCER (optional): custom reward with self-proposed rubrics
+# GEAR (optional): custom reward with self-proposed rubrics
 #
 # To enable:
 # 1) set reward manager to batch mode
-# 2) point custom_reward_function.path to vagen/rlcer/reward_rlcer.py
+# 2) point custom_reward_function.path to vagen/gear/reward_gear.py
 # 3) pass reward_kwargs below
 #
 # Example CLI overrides:
 #   reward_model.reward_manager=batch \
-#   custom_reward_function.path=vagen/rlcer/reward_rlcer.py \
+#   custom_reward_function.path=vagen/gear/reward_gear.py \
 #   custom_reward_function.name=compute_score
 # ============================================================================
 custom_reward_function:

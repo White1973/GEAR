@@ -64,16 +64,16 @@ filter:
   enable: True
 ```
 
-## RLCER Custom Reward (Optional)
+## GEAR Custom Reward (Optional)
 
-RLCER is enabled via `custom_reward_function` (no trainer-core patch required).
+GEAR is enabled via `custom_reward_function` (no trainer-core patch required).
 
 ```yaml
 reward_model:
   reward_manager: batch
 
 custom_reward_function:
-  path: vagen/rlcer/reward_rlcer.py
+  path: vagen/gear/reward_gear.py
   name: compute_score
   reward_kwargs:
     alpha: 0.2

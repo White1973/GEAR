@@ -113,137 +113,13 @@ def _format_history_items(items: List[dict], max_items: int = 4, max_chars: int 
     blocks: List[str] = []
     for it in trimmed:
         tid = it.get("turn_idx")
-        structured = _extract_structured_sections(str(it.get("solution", "")))
-        blocks.append(
-            "\n".join(
-                [
-                    f"[Turn {tid}]",
-                    "observation:",
-                    structured["observation"],
-                    "think:",
-                    structured["think"],
-                    "answer:",
-                    structured["answer"],
-                    "prediction:",
-                    structured["prediction"],
-                ]
-            )
-        )
+        ans = str(it.get("answer", "")).strip()
+        cot = str(it.get("cot", "")).strip()
+        if len(cot) > 240:
+            cot = cot[:240] + "..."
+        blocks.append(f"Turn {tid}: answer={ans}; cot={cot}")
 
-    text = "\n\n".join(blocks)
-    if len(text) > max_chars:
-        text = text[-max_chars:]
-    return text
-
-
-def _extract_structured_sections(solution: str) -> Dict[str, str]:
-    """Parse solver response into observation/think/answer/prediction sections.
-
-    Strict section names are preferred. Falls back to robust heuristics if sections
-    are partially missing.
-    """
-    s = (solution or "").strip()
-    if not s:
-        return {"observation": "", "think": "", "answer": "", "prediction": ""}
-
-    # Normalize full-width colon for robustness.
-    s = s.replace("：", ":")
-    lower = s.lower()
-
-    # Candidate heading aliases mapped to canonical key.
-    heading_aliases = {
-        "observation": ["observation", "观察", "obs"],
-        "think": ["think", "reasoning", "thought", "思考", "analysis"],
-        "answer": ["answer", "action", "动作", "结论"],
-        "prediction": ["prediction", "predict", "预测"],
-    }
-
-    # Locate first occurrence of each canonical heading.
-    positions: List[tuple[int, str, int]] = []
-    for key, aliases in heading_aliases.items():
-        best_pos = None
-        best_len = 0
-        for a in aliases:
-            m = re.search(rf"(?im)(^|\n)\s*(?:\[?\s*){re.escape(a)}\s*\]?\s*:\s*", lower)
-            if m is not None:
-                p = m.start()
-                if best_pos is None or p < best_pos:
-                    best_pos = p
-                    best_len = len(m.group(0))
-        if best_pos is not None:
-            positions.append((best_pos, key, best_len))
-
-    positions.sort(key=lambda x: x[0])
-    out = {"observation": "", "think": "", "answer": "", "prediction": ""}
-
-    if positions:
-        for i, (start, key, hlen) in enumerate(positions):
-            body_start = start + hlen
-            body_end = positions[i + 1][0] if i + 1 < len(positions) else len(s)
-            content = s[body_start:body_end].strip()
-            out[key] = content
-
-    # Fallbacks if headings are missing
-    if not out["answer"]:
-        _, ans = _extract_cot_and_answer(s)
-        out["answer"] = ans
-    if not out["think"]:
-        out["think"] = s[:500]
-    if not out["observation"]:
-        out["observation"] = "(not explicitly provided)"
-    if not out["prediction"]:
-        out["prediction"] = "(not explicitly provided)"
-
-    # Keep sections concise for prompt budget
-    for k in out.keys():
-        if len(out[k]) > 600:
-            out[k] = out[k][:600] + "..."
-    return out
-
-
-def _extract_concat_turn_candidates(text: str, max_turns: int = 6) -> List[Dict[str, str]]:
-    """Best-effort extraction of multiple structured turns from concat-mode text."""
-    s = (text or "").replace("：", ":")
-    if not s.strip():
-        return []
-
-    # Split by repeated observation heading as turn boundary.
-    chunks = re.split(r"(?im)(?=^\s*\[?\s*observation\s*\]?\s*:)", s)
-    turns: List[Dict[str, str]] = []
-    for c in chunks:
-        c = c.strip()
-        if not c:
-            continue
-        sec = _extract_structured_sections(c)
-        # require at least one non-fallback signal
-        if sec["answer"] or sec["think"]:
-            turns.append(sec)
-    if len(turns) > max_turns:
-        turns = turns[-max_turns:]
-    return turns
-
-
-def _format_structured_history_from_sections(sections: List[Dict[str, str]], max_chars: int = 1800) -> str:
-    if not sections:
-        return "None (Initial Turn)"
-    blocks: List[str] = []
-    for i, sec in enumerate(sections, start=1):
-        blocks.append(
-            "\n".join(
-                [
-                    f"[Turn {i}]",
-                    "observation:",
-                    sec.get("observation", ""),
-                    "think:",
-                    sec.get("think", ""),
-                    "answer:",
-                    sec.get("answer", ""),
-                    "prediction:",
-                    sec.get("prediction", ""),
-                ]
-            )
-        )
-    text = "\n\n".join(blocks)
+    text = "\n".join(blocks)
     if len(text) > max_chars:
         text = text[-max_chars:]
     return text
@@ -262,27 +138,6 @@ def _build_trajectory_history_for_items(items: List[dict]) -> List[str]:
         group_traj_to_indices.setdefault(key, []).append(i)
 
     histories = ["None (Initial Turn)"] * len(items)
-
-    # Detect mode: if turn_idx is mostly available, treat as no-concat.
-    has_turn = sum(1 for x in items if x.get("turn_idx") is not None)
-    no_concat_mode = has_turn >= max(1, len(items) // 2)
-
-    if not no_concat_mode:
-        # Concat-mode optimization: derive history from serialized text of each sample.
-        for i, x in enumerate(items):
-            combined_text = f"{x.get('prompt_str', '')}\n{x.get('solution', '')}"
-            turns = _extract_concat_turn_candidates(combined_text)
-            # For current rubric generation, history should be previous turns only.
-            if len(turns) >= 2:
-                histories[i] = _format_structured_history_from_sections(turns[:-1])
-            elif len(turns) == 1:
-                histories[i] = "None (Initial Turn)"
-            else:
-                prompt_str = str(x.get("prompt_str", "")).strip()
-                histories[i] = prompt_str if prompt_str else "None (Initial Turn)"
-        return histories
-
-    # no-concat mode: use prior turns from same (group, traj_idx).
     for _, idxs in group_traj_to_indices.items():
         idxs_sorted = sorted(
             idxs,
@@ -924,7 +779,7 @@ def compute_score(
     extra_info=None,
     **kwargs,
 ):
-    """RLCER custom reward function.
+    """GEAR custom reward function.
 
     Supports both VERL batch reward-manager signature and single-item signature.
 

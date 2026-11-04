@@ -2,7 +2,7 @@
 
 These features deliberately do not reuse DINO, DreamSim, or the environment
 reward.  They provide an independent satisfaction signal ``v`` that can be
-correlated with the environment feedback ``z`` by RLCER.
+correlated with the environment feedback ``z`` by GEAR.
 """
 
 from __future__ import annotations
